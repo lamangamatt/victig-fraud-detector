@@ -1,0 +1,15 @@
+# Core
+streamlit>=1.30.0
+Pillow>=10.0.0
+
+# PDF Processing
+PyMuPDF>=1.23.0  # fitz
+
+# OCR (optional but recommended)
+pytesseract>=0.3.10
+
+# AI Analysis (optional)
+anthropic>=0.18.0
+
+# Additional utilities
+python-dateutil>=2.8.0
