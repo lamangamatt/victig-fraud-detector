@@ -410,7 +410,7 @@ class DocumentAnalyzer:
             )
     
     def _check_creation_date(self, metadata: Dict, doc_type: str):
-        """Check if creation date is suspicious."""
+        """Check if creation date is suspicious - smart detection for portal downloads."""
         creation_date = metadata.get('creation_date')
         if not creation_date:
             return
@@ -428,37 +428,67 @@ class DocumentAnalyzer:
             days_old = (datetime.now() - created).days
             hours_old = (datetime.now() - created).total_seconds() / 3600
             
-            if hours_old < 24:
-                self._add_flag(
-                    'Created Today',
-                    f'Document was created within the last {int(hours_old)} hours. If this represents an older pay period, this is highly suspicious.',
-                    'critical',
-                    35
-                )
-            elif days_old < 3:
-                self._add_flag(
-                    'Very Recently Created',
-                    f'Document was created {days_old} days ago.',
-                    'critical',
-                    25
-                )
-            elif days_old < 7:
-                self._add_flag(
-                    'Recently Created',
-                    f'Document was created within the last week ({days_old} days ago).',
-                    'warning',
-                    15
-                )
-                
-            # Check modification date vs creation date
+            # Check modification date vs creation date FIRST - this is the real red flag
             mod_date = metadata.get('modification_date')
-            if mod_date and mod_date != creation_date:
+            was_modified = mod_date and mod_date != creation_date
+            
+            if was_modified:
                 self._add_flag(
                     'Document Modified After Creation',
-                    f'Created: {creation_date}, Modified: {mod_date}. The document was edited after initial creation.',
-                    'warning',
-                    20
+                    f'Created: {creation_date}, Modified: {mod_date}. The document was edited after initial creation. This is a significant fraud indicator.',
+                    'critical',
+                    30
                 )
+            
+            # For recent creation dates, context matters:
+            # - Pay stubs, bank statements are EXPECTED to be recently created (downloaded from portals)
+            # - Modification after creation is the real red flag
+            # - Only flag recent creation as suspicious if combined with other factors
+            
+            portal_download_types = ['Pay Stub', 'Bank Statement', 'W-2', 'Tax Document', '1099']
+            is_portal_type = doc_type in portal_download_types
+            
+            if hours_old < 24:
+                if is_portal_type and not was_modified:
+                    # Normal for portal downloads - just informational
+                    self._add_flag(
+                        'Recently Downloaded',
+                        f'Document was created within the last {int(hours_old)} hours. This is typical for documents downloaded from payroll or banking portals.',
+                        'info',
+                        0  # No risk score impact
+                    )
+                elif was_modified:
+                    # Recently created AND modified - very suspicious
+                    self._add_flag(
+                        'Created and Modified Today',
+                        f'Document was created AND modified within the last {int(hours_old)} hours. This suggests active editing.',
+                        'critical',
+                        25
+                    )
+                else:
+                    # Unknown doc type, recently created - mild flag
+                    self._add_flag(
+                        'Created Today',
+                        f'Document was created within the last {int(hours_old)} hours.',
+                        'info',
+                        5
+                    )
+            elif days_old < 7:
+                if is_portal_type and not was_modified:
+                    # Still normal for portal downloads
+                    self._add_flag(
+                        'Recently Created',
+                        f'Document was created {days_old} days ago. Normal for documents downloaded from employer/bank portals.',
+                        'info',
+                        0
+                    )
+                elif not is_portal_type:
+                    self._add_flag(
+                        'Recently Created',
+                        f'Document was created within the last week ({days_old} days ago).',
+                        'info',
+                        5
+                    )
                 
         except Exception:
             pass
