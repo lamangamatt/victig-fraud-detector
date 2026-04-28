@@ -3,7 +3,8 @@ streamlit>=1.30.0
 Pillow>=10.0.0
 
 # PDF Processing
-PyMuPDF>=1.23.0  # fitz
+PyMuPDF>=1.23.0
+fpdf2>=2.7.0
 
 # OCR (optional but recommended)
 pytesseract>=0.3.10
