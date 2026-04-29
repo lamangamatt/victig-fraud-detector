@@ -569,6 +569,49 @@ class DocumentAnalyzer:
                 )
                 break
         
+        # Check for invalid text in fields that should be numeric or blank
+        invalid_field_values = ['n/a', 'not needed', 'not applicable', 'none', 'na', 'n.a.', 
+                                'see attached', 'refer to', 'tbd', 'pending']
+        for invalid_val in invalid_field_values:
+            # Look for these near dollar signs, box numbers, or common W2/pay stub fields
+            patterns = [
+                rf'\$\s*{re.escape(invalid_val)}',
+                rf'box\s*\d+[:\s]*{re.escape(invalid_val)}',
+                rf'wages[:\s]*{re.escape(invalid_val)}',
+                rf'tax[:\s]*{re.escape(invalid_val)}',
+                rf'gross[:\s]*{re.escape(invalid_val)}',
+                rf'net[:\s]*{re.escape(invalid_val)}',
+                rf'withholding[:\s]*{re.escape(invalid_val)}',
+            ]
+            for pattern in patterns:
+                if re.search(pattern, text_lower):
+                    self._add_flag(
+                        'Invalid Field Value',
+                        f'Document contains "{invalid_val}" in a field that should be numeric or blank. Legitimate payroll systems use 0 or leave fields empty.',
+                        'critical',
+                        35
+                    )
+                    break
+        
+        # Check for missing or suspicious year formats on W-2s
+        if doc_type == "W-2":
+            # Look for tax year - should be prominently displayed
+            year_pattern = r'(?:tax\s*year|form\s*w-?2)[:\s]*(\d{4}|\d{2})'
+            year_match = re.search(year_pattern, text_lower)
+            
+            # Check if year is missing entirely
+            current_year = datetime.now().year
+            valid_years = [str(y) for y in range(current_year - 5, current_year + 1)]
+            has_valid_year = any(year in text for year in valid_years)
+            
+            if not has_valid_year:
+                self._add_flag(
+                    'Missing Tax Year',
+                    'W-2 does not contain a clearly visible tax year. This is required on all legitimate W-2 forms.',
+                    'critical',
+                    40
+                )
+        
         # Check for inconsistent date formats
         date_patterns = [
             r'\d{1,2}/\d{1,2}/\d{2,4}',  # MM/DD/YYYY
@@ -1006,40 +1049,62 @@ CONTEXT:
 
 ANALYZE FOR:
 
-1. **Visual Consistency**
-   - Are fonts consistent throughout? (Size, style, spacing)
-   - Is text alignment uniform?
+1. **Font Consistency** (CRITICAL - Common fraud indicator)
+   - Are ALL fonts consistent throughout the document? Check EVERY text element.
+   - Look for font mismatches in: dates, years, dollar amounts, names, addresses
+   - Check if any text appears darker, bolder, or in a different typeface than surrounding text
+   - Look for text that appears to have been added later (different font weight, size, or style)
+   - Check if numbers in the same column use different fonts
+
+2. **Year/Date Tampering** (CRITICAL - Very common on fake W-2s)
+   - Is the tax year clearly visible and in the same font as other text?
+   - Look for years that appear printed ON TOP of other text (overprint)
+   - Check for black boxes, white boxes, or rectangles covering original dates with new dates overlaid
+   - Look for dates where the font color or darkness differs from surrounding text
+   - Check if year digits appear misaligned or at different baselines
+   - Look for any rectangular areas that seem to cover/redact original content
+
+3. **Invalid Field Values**
+   - Check for "N/A", "Not Needed", "None", or similar text in boxes that should contain numbers or be blank
+   - Legitimate W-2s and pay stubs use $0.00 or leave fields empty - never "N/A"
+
+4. **Visual Consistency**
+   - Is text alignment uniform throughout?
    - Do numbers align properly in columns?
-   - Are there any visible cut/paste lines or artifacts?
+   - Are there any visible cut/paste lines, edges, or artifacts?
+   - Look for areas with different compression, blur, or sharpness levels
 
-2. **Template Authenticity** 
-   - Does this look like a genuine payroll system output?
+5. **Template Authenticity** 
+   - Does this look like a genuine payroll system output (ADP, Paychex, etc.)?
    - Is the layout consistent with professional payroll software?
-   - Are logos/headers crisp or potentially copied?
+   - Are logos/headers crisp or potentially copied/pasted?
 
-3. **Data Integrity**
-   - Do the visible numbers appear mathematically consistent?
-   - Are date formats consistent?
-   - Does the employer information look legitimate?
-
-4. **Manipulation Indicators**
-   - Any signs of image editing (blur, sharpening differences)?
-   - Inconsistent shadows or lighting?
-   - Text that appears to float or not sit naturally?
-   - Different quality/resolution in different areas?
-
-5. **Red Flags**
-   - Anything that seems "too perfect" or templated?
-   - Missing standard elements (company logo, pay period, etc.)?
-   - Unusual formatting or layout choices?
+6. **Manipulation Indicators**
+   - Any signs of image editing (blur around certain text, sharpening differences)?
+   - Inconsistent shadows or lighting around text elements?
+   - Text that appears to float or not sit naturally on the background?
+   - Different quality/resolution in different areas of the document?
+   - White or colored rectangles that might be covering original content?
 
 RESPOND IN THIS JSON FORMAT:
 {{
     "overall_assessment": "LIKELY_LEGITIMATE" | "SUSPICIOUS" | "LIKELY_FRAUDULENT",
     "confidence": 0-100,
+    "font_consistency": {{
+        "consistent": true/false,
+        "issues": ["describe each font mismatch found - location and nature of mismatch"]
+    }},
+    "date_year_tampering": {{
+        "detected": true/false,
+        "issues": ["describe any year/date tampering: overprints, covered text, font differences in dates"]
+    }},
+    "invalid_field_values": {{
+        "detected": true/false,
+        "issues": ["list any N/A, Not Needed, or similar invalid text in numeric fields"]
+    }},
     "visual_consistency": {{
         "score": 0-100,
-        "issues": ["list of issues found"]
+        "issues": ["list of visual issues found"]
     }},
     "template_authenticity": {{
         "score": 0-100,
@@ -1048,7 +1113,7 @@ RESPOND IN THIS JSON FORMAT:
     }},
     "manipulation_indicators": {{
         "detected": true/false,
-        "indicators": ["list of specific indicators"]
+        "indicators": ["list of specific indicators: blur, cut lines, rectangles covering text, etc."]
     }},
     "key_findings": ["most important findings, max 5"],
     "recommendation": "brief recommendation for the reviewer"
@@ -1112,6 +1177,42 @@ RESPOND IN THIS JSON FORMAT:
                             'info',
                             -10
                         )
+                    
+                    # Add font consistency flags
+                    font_check = ai_result.get('font_consistency', {})
+                    if font_check.get('consistent') == False:
+                        font_issues = font_check.get('issues', [])
+                        for issue in font_issues[:3]:
+                            self._add_flag(
+                                'Font Mismatch Detected',
+                                issue,
+                                'critical',
+                                25
+                            )
+                    
+                    # Add date/year tampering flags
+                    date_check = ai_result.get('date_year_tampering', {})
+                    if date_check.get('detected'):
+                        date_issues = date_check.get('issues', [])
+                        for issue in date_issues[:2]:
+                            self._add_flag(
+                                'Date/Year Tampering Detected',
+                                issue,
+                                'critical',
+                                35
+                            )
+                    
+                    # Add invalid field value flags from AI
+                    invalid_check = ai_result.get('invalid_field_values', {})
+                    if invalid_check.get('detected'):
+                        invalid_issues = invalid_check.get('issues', [])
+                        for issue in invalid_issues[:2]:
+                            self._add_flag(
+                                'Invalid Field Value (AI)',
+                                issue,
+                                'critical',
+                                30
+                            )
                     
                     # Add manipulation indicator flags
                     if ai_result.get('manipulation_indicators', {}).get('detected'):
