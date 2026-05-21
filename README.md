@@ -102,21 +102,26 @@ Or use Streamlit Cloud's built-in auth.
 ### SSN Truncation Rules (IRS)
 The IRS allows employers to truncate Social Security Numbers on employee documents, but **only the first 5 digits** may be hidden. The last 4 digits must remain visible.
 
-**Valid formats:**
-- `XXX-XX-1234` ✓
+**Acceptable formats (no penalty):**
+- `XXX-XX-1234` ✓ (IRS standard - last 4 visible)
 - `***-**-1234` ✓
-- `___-__-1234` ✓
+- `XXX-XX-XXXX` ✓ (fully redacted - acceptable for privacy)
+- `***-**-****` ✓
 
-**Invalid/Suspicious formats:**
-- `XXX-XX-XXXX` ⚠️ (fully redacted - may be template)
-- `XXX-XX-XX34` ⚠️ (only 2 digits visible)
-- `XXX-XX-X234` ⚠️ (only 3 digits visible)
-- No SSN visible at all ⚠️
+**Suspicious formats (penalty):**
+- `XXX-XX-XXX4` ⚠️ (only 1 digit visible) +20 points
+- `XXX-XX-XX34` ⚠️ (only 2 digits visible) +20 points  
+- `XXX-XX-X234` ⚠️ (only 3 digits visible) +20 points
 
-If more than 5 digits are truncated, this could indicate:
-1. A template document that wasn't properly filled in
-2. An attempt to hide that the SSN doesn't match the stated employee
-3. A fabricated document where the fraudster doesn't have a real SSN
+**Why is 1-3 visible suspicious?**
+Legitimate documents either:
+1. Show the last 4 digits (IRS standard), OR
+2. Fully redact the SSN (candidate privacy)
+
+Showing only 1-3 digits is unusual and could indicate:
+- Document manipulation (someone changed digits)
+- Attempt to make a fake SSN look partially real
+- Cut-and-paste from multiple sources
 
 **Reference:** IRS Pub 1586 - Truncated Taxpayer Identification Numbers
 

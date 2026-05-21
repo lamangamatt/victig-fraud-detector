@@ -667,11 +667,35 @@ class DocumentAnalyzer:
         """Check for improperly truncated SSNs.
         
         Per IRS rules (Pub 1586), employers may truncate the first 5 digits of SSN,
-        but the last 4 digits MUST remain visible. Over-truncation is suspicious.
+        but the last 4 digits MUST remain visible.
+        
+        Scoring:
+        - Fully hidden (XXX-XX-XXXX) or last 4 visible (XXX-XX-1234): OK, no penalty
+        - 1, 2, or 3 digits visible: SUSPICIOUS - why partial? Likely manipulation
         """
         text_lower = text.lower()
         
-        # Pattern for fully redacted SSN (all 9 digits hidden) - suspicious
+        # Pattern for partial visibility (1-3 digits) - THIS IS SUSPICIOUS
+        # Why would someone show only 1-3 digits? This is the fraud indicator.
+        partial_visible = [
+            (r'[x\*_]{3}-[x\*_]{2}-[x\*_]{3}\d{1}', 1),  # Only last 1 digit visible
+            (r'[x\*_]{3}-[x\*_]{2}-[x\*_]{2}\d{2}', 2),  # Only last 2 digits visible
+            (r'[x\*_]{3}-[x\*_]{2}-[x\*_]{1}\d{3}', 3),  # Only last 3 digits visible
+        ]
+        
+        for pattern, visible_count in partial_visible:
+            if re.search(pattern, text_lower):
+                self._add_flag(
+                    'SSN Partially Visible',
+                    f'SSN shows only {visible_count} digit(s) instead of the standard 4. '
+                    'This unusual format could indicate document manipulation. '
+                    'Legitimate documents show either last 4 digits (IRS standard) or fully redact the SSN.',
+                    'warning',
+                    20  # Suspicious - why would someone show only 1-3 digits?
+                )
+                return
+        
+        # Fully redacted SSN - acceptable (candidate privacy choice)
         fully_redacted = [
             r'xxx-xx-xxxx',
             r'\*{3}-\*{2}-\*{4}',
@@ -684,42 +708,20 @@ class DocumentAnalyzer:
             if re.search(pattern, text_lower):
                 self._add_flag(
                     'SSN Fully Redacted',
-                    'SSN appears to be completely redacted with no digits visible. '
-                    'Per IRS rules, the last 4 digits should remain visible on legitimate documents. '
-                    'This may indicate a template or fabricated document.',
-                    'warning',
-                    20
+                    'SSN is completely redacted. This is acceptable for candidate privacy.',
+                    'info',
+                    0  # No penalty - legitimate privacy choice
                 )
                 return
         
-        # Pattern for over-truncation (fewer than 4 digits visible at end)
-        # Matches patterns like XXX-XX-XX34 (only 2 visible) or XXX-XX-X234 (only 3 visible)
-        over_truncated = [
-            r'[x\*_]{3}-[x\*_]{2}-[x\*_]{2}\d{2}',  # Only last 2 digits
-            r'[x\*_]{3}-[x\*_]{2}-[x\*_]{1}\d{3}',  # Only last 3 digits
-            r'[x\*_]{3}-[x\*_]{2}-[x\*_]{3}\d{1}',  # Only last 1 digit
-        ]
-        
-        for pattern in over_truncated:
-            if re.search(pattern, text_lower):
-                self._add_flag(
-                    'SSN Over-Truncated',
-                    'SSN shows fewer than the required 4 visible digits. '
-                    'IRS rules allow truncating only the first 5 digits (XXX-XX-1234). '
-                    'This could indicate document manipulation or a template.',
-                    'warning',
-                    15
-                )
-                return
-        
-        # Check for properly truncated SSN (positive indicator)
+        # Properly truncated SSN (last 4 visible) - follows IRS guidelines
         proper_truncation = r'[x\*_]{3}-[x\*_]{2}-\d{4}'
         if re.search(proper_truncation, text_lower):
             self._add_flag(
                 'SSN Properly Truncated',
                 'SSN is truncated per IRS guidelines (first 5 digits hidden, last 4 visible).',
                 'info',
-                -3  # Small bonus for following proper format
+                0  # No penalty - follows standard format
             )
     
     def _detect_visual_redactions(self, image) -> bool:
