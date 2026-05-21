@@ -83,6 +83,7 @@ Or use Streamlit Cloud's built-in auth.
 - Creation date within last 48 hours for older pay periods
 - Math errors (net pay > gross pay)
 - AI-generated content detected
+- SSN over-truncated (more than 5 digits hidden - see Knowledge Base)
 
 ### Medium Risk Indicators (🟡)
 - Recently created document (within 7 days)
@@ -94,6 +95,38 @@ Or use Streamlit Cloud's built-in auth.
 - Created by known payroll systems (ADP, Paychex, Gusto, etc.)
 - Math validates correctly
 - Consistent formatting
+- Appropriate redactions (SSN last 4 visible, per IRS rules)
+
+## Knowledge Base
+
+### SSN Truncation Rules (IRS)
+The IRS allows employers to truncate Social Security Numbers on employee documents, but **only the first 5 digits** may be hidden. The last 4 digits must remain visible.
+
+**Valid formats:**
+- `XXX-XX-1234` ✓
+- `***-**-1234` ✓
+- `___-__-1234` ✓
+
+**Invalid/Suspicious formats:**
+- `XXX-XX-XXXX` ⚠️ (fully redacted - may be template)
+- `XXX-XX-XX34` ⚠️ (only 2 digits visible)
+- `XXX-XX-X234` ⚠️ (only 3 digits visible)
+- No SSN visible at all ⚠️
+
+If more than 5 digits are truncated, this could indicate:
+1. A template document that wasn't properly filled in
+2. An attempt to hide that the SSN doesn't match the stated employee
+3. A fabricated document where the fraudster doesn't have a real SSN
+
+**Reference:** IRS Pub 1586 - Truncated Taxpayer Identification Numbers
+
+### Legitimate Redactions
+Candidates may be asked to redact certain information for privacy/compliance:
+- Bank account numbers (partial redaction OK)
+- Home addresses
+- Dependent SSNs
+
+These redactions are expected and should not trigger fraud flags when done with standard tools (Preview, Acrobat, phone markup apps).
 
 ## Roadmap
 

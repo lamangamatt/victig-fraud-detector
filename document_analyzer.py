@@ -658,7 +658,69 @@ class DocumentAnalyzer:
                 -5  # Small bonus - shows candidate followed instructions
             )
         
+        # Check for SSN over-truncation (IRS allows only first 5 digits to be hidden)
+        self._check_ssn_truncation(text)
+        
         return redaction_found
+    
+    def _check_ssn_truncation(self, text: str):
+        """Check for improperly truncated SSNs.
+        
+        Per IRS rules (Pub 1586), employers may truncate the first 5 digits of SSN,
+        but the last 4 digits MUST remain visible. Over-truncation is suspicious.
+        """
+        text_lower = text.lower()
+        
+        # Pattern for fully redacted SSN (all 9 digits hidden) - suspicious
+        fully_redacted = [
+            r'xxx-xx-xxxx',
+            r'\*{3}-\*{2}-\*{4}',
+            r'\*{9}',
+            r'x{9}',
+            r'___-__-____',
+        ]
+        
+        for pattern in fully_redacted:
+            if re.search(pattern, text_lower):
+                self._add_flag(
+                    'SSN Fully Redacted',
+                    'SSN appears to be completely redacted with no digits visible. '
+                    'Per IRS rules, the last 4 digits should remain visible on legitimate documents. '
+                    'This may indicate a template or fabricated document.',
+                    'warning',
+                    20
+                )
+                return
+        
+        # Pattern for over-truncation (fewer than 4 digits visible at end)
+        # Matches patterns like XXX-XX-XX34 (only 2 visible) or XXX-XX-X234 (only 3 visible)
+        over_truncated = [
+            r'[x\*_]{3}-[x\*_]{2}-[x\*_]{2}\d{2}',  # Only last 2 digits
+            r'[x\*_]{3}-[x\*_]{2}-[x\*_]{1}\d{3}',  # Only last 3 digits
+            r'[x\*_]{3}-[x\*_]{2}-[x\*_]{3}\d{1}',  # Only last 1 digit
+        ]
+        
+        for pattern in over_truncated:
+            if re.search(pattern, text_lower):
+                self._add_flag(
+                    'SSN Over-Truncated',
+                    'SSN shows fewer than the required 4 visible digits. '
+                    'IRS rules allow truncating only the first 5 digits (XXX-XX-1234). '
+                    'This could indicate document manipulation or a template.',
+                    'warning',
+                    15
+                )
+                return
+        
+        # Check for properly truncated SSN (positive indicator)
+        proper_truncation = r'[x\*_]{3}-[x\*_]{2}-\d{4}'
+        if re.search(proper_truncation, text_lower):
+            self._add_flag(
+                'SSN Properly Truncated',
+                'SSN is truncated per IRS guidelines (first 5 digits hidden, last 4 visible).',
+                'info',
+                -3  # Small bonus for following proper format
+            )
     
     def _detect_visual_redactions(self, image) -> bool:
         """Detect black boxes or marker redactions in an image."""
