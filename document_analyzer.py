@@ -102,6 +102,33 @@ class DocumentAnalyzer:
         'microsoft print': ('Microsoft Print to PDF', 0),  # Reduced from 10 - completely normal
     }
     
+    # Legitimate redaction tools - should not be penalized when redactions detected
+    REDACTION_TOOLS = {
+        'acrobat': 'Adobe Acrobat',
+        'acrobat pro': 'Adobe Acrobat Pro',
+        'preview': 'macOS Preview',
+        'foxit': 'Foxit PDF',
+        'pdf-xchange': 'PDF-XChange',
+        'apple markup': 'iOS/iPadOS Markup',
+        'markup': 'Markup Tool',
+        'photos': 'Photos App',
+        'snapseed': 'Snapseed',
+        'picsart': 'PicsArt',
+    }
+    
+    # Patterns that indicate intentional redaction
+    REDACTION_PATTERNS = [
+        r'xxx-xx-\d{4}',      # Redacted SSN (last 4 visible)
+        r'\*{3}-\*{2}-\d{4}', # Redacted SSN with asterisks
+        r'xxx-xx-xxxx',        # Fully redacted SSN
+        r'\*{4,}',             # Multiple asterisks
+        r'x{4,}',              # Multiple x's
+        r'\[redacted\]',       # Explicit redaction marker
+        r'\[removed\]',        # Removal marker
+        r'account.*x{4}',      # Redacted account number
+        r'x{4}\d{4}',          # Last 4 of account visible
+    ]
+    
     # AI-related indicators - highest risk
     AI_INDICATORS = [
         ('chatgpt', 50),
@@ -129,12 +156,16 @@ class DocumentAnalyzer:
         self.flags: List[Dict] = []
         self.risk_score = 0
         self.use_ai = use_ai and HAS_ANTHROPIC and os.environ.get('ANTHROPIC_API_KEY')
+        self.redactions_detected = False
+        self.redaction_tool_used = None
         self.ai_client = anthropic.Anthropic() if self.use_ai else None
         
     def analyze(self, file_path: str, doc_type: str = "Pay Stub") -> Dict[str, Any]:
         """Main analysis entry point."""
         self.flags = []
         self.risk_score = 0
+        self.redactions_detected = False
+        self.redaction_tool_used = None
         
         results = {
             'file_path': file_path,
@@ -170,15 +201,20 @@ class DocumentAnalyzer:
         self._current_image = image
         self._current_image_path = file_path
         
+        # Early redaction detection - must run before creator tool check
+        # This sets self.redactions_detected which affects how we score editing tools
+        if text:
+            self._detect_redactions(text)
+        
         # Run all checks
         self._check_metadata_flags(results['metadata'])
         self._check_creation_date(results['metadata'], doc_type)
-        self._check_creator_tool(results['metadata'])
+        self._check_creator_tool(results['metadata'])  # Now aware of redactions
         self._check_file_anomalies(file_path, results['metadata'])
         
         if text:
             results['extracted_data'] = self._extract_document_data(text, doc_type)
-            self._check_text_anomalies(text, doc_type)
+            self._check_text_anomalies(text, doc_type)  # Runs additional text checks
             
             if doc_type == "Pay Stub":
                 results['math_validation'] = self._validate_pay_stub_math(text, results['extracted_data'])
@@ -495,14 +531,18 @@ class DocumentAnalyzer:
             pass
     
     def _check_creator_tool(self, metadata: Dict):
-        """Check if document was created with suspicious software."""
+        """Check if document was created with suspicious software.
+        
+        When redactions are detected, common redaction tools (Preview, Acrobat, etc.)
+        are not penalized since candidates are often asked to redact sensitive info.
+        """
         creator = (metadata.get('creator', '') or '').lower()
         producer = (metadata.get('producer', '') or '').lower()
         software = (metadata.get('software', '') or '').lower()
         
         combined = f"{creator} {producer} {software}"
         
-        # Check for AI indicators first (highest risk)
+        # Check for AI indicators first (highest risk) - always flag these
         for indicator, score in self.AI_INDICATORS:
             if indicator in combined:
                 self._add_flag(
@@ -513,16 +553,41 @@ class DocumentAnalyzer:
                 )
                 return
         
+        # If redactions were detected, check if a legitimate redaction tool was used
+        if self.redactions_detected:
+            for tool_key, tool_name in self.REDACTION_TOOLS.items():
+                if tool_key in combined:
+                    self.redaction_tool_used = tool_name
+                    self._add_flag(
+                        f'Redaction Tool: {tool_name}',
+                        f'Document was edited with {tool_name}, likely for redacting sensitive information as requested. '
+                        'This is expected when candidates protect SSN, account numbers, or other PII.',
+                        'info',
+                        0  # No penalty when redaction tool + redactions detected
+                    )
+                    return
+        
         # Check for suspicious editing tools
         for tool_key, (tool_name, score) in self.SUSPICIOUS_CREATORS.items():
             if tool_key in combined:
-                severity = 'critical' if score >= 30 else 'warning'
-                self._add_flag(
-                    f'Suspicious Software: {tool_name}',
-                    f'Document was created/edited with {tool_name}. Legitimate payroll documents come directly from payroll systems.',
-                    severity,
-                    score
-                )
+                # Reduce penalty if redactions detected but tool not in whitelist
+                if self.redactions_detected:
+                    adjusted_score = max(5, score // 3)  # Reduce to 1/3, minimum 5
+                    self._add_flag(
+                        f'Editing Software: {tool_name}',
+                        f'Document was edited with {tool_name}. Redactions were detected, '
+                        'which may explain the use of editing software.',
+                        'info',
+                        adjusted_score
+                    )
+                else:
+                    severity = 'critical' if score >= 30 else 'warning'
+                    self._add_flag(
+                        f'Suspicious Software: {tool_name}',
+                        f'Document was created/edited with {tool_name}. Legitimate payroll documents come directly from payroll systems.',
+                        severity,
+                        score
+                    )
                 return
         
         # Check for legitimate payroll software (reduces risk)
@@ -552,12 +617,102 @@ class DocumentAnalyzer:
                         40
                     )
     
+    def _detect_redactions(self, text: str, images: List = None) -> bool:
+        """Detect if document contains intentional redactions.
+        
+        Candidates are often asked to redact SSN, account numbers, etc.
+        This is legitimate and expected behavior.
+        """
+        text_lower = text.lower()
+        redaction_found = False
+        redaction_types = []
+        
+        # Check text patterns for redactions
+        for pattern in self.REDACTION_PATTERNS:
+            if re.search(pattern, text_lower):
+                redaction_found = True
+                # Identify what type of redaction
+                if 'xxx-xx' in pattern or 'ssn' in pattern or '\*{3}-\*{2}' in pattern:
+                    redaction_types.append('SSN')
+                elif 'account' in pattern or 'x{4}\\d{4}' in pattern:
+                    redaction_types.append('Account Number')
+                else:
+                    redaction_types.append('Sensitive Data')
+        
+        # Check for visual redaction indicators (black boxes) in images
+        if images and not redaction_found:
+            for img in images[:3]:  # Check first 3 pages
+                if self._detect_visual_redactions(img):
+                    redaction_found = True
+                    redaction_types.append('Visual Redaction')
+                    break
+        
+        if redaction_found:
+            self.redactions_detected = True
+            unique_types = list(set(redaction_types))
+            self._add_flag(
+                'Appropriate Redactions Detected',
+                f'Document contains redacted sensitive information ({', '.join(unique_types)}). '
+                'This is expected when candidates are asked to protect SSN, account numbers, or other PII.',
+                'info',
+                -5  # Small bonus - shows candidate followed instructions
+            )
+        
+        return redaction_found
+    
+    def _detect_visual_redactions(self, image) -> bool:
+        """Detect black boxes or marker redactions in an image."""
+        try:
+            if isinstance(image, bytes):
+                img = Image.open(io.BytesIO(image))
+            elif isinstance(image, str):
+                img = Image.open(image)
+            else:
+                img = image
+            
+            # Convert to grayscale
+            gray = img.convert('L')
+            img_array = np.array(gray)
+            
+            # Look for large dark rectangular regions (black boxes)
+            # These are typically redaction marks
+            dark_threshold = 30  # Very dark pixels
+            dark_pixels = img_array < dark_threshold
+            
+            # Check if there are concentrated dark regions (potential redaction boxes)
+            # This is a simplified check - looking for horizontal runs of dark pixels
+            rows_with_dark_runs = 0
+            for row in dark_pixels:
+                # Look for runs of 20+ consecutive dark pixels
+                run_length = 0
+                max_run = 0
+                for pixel in row:
+                    if pixel:
+                        run_length += 1
+                        max_run = max(max_run, run_length)
+                    else:
+                        run_length = 0
+                if max_run >= 20:
+                    rows_with_dark_runs += 1
+            
+            # If multiple rows have dark runs, likely a redaction box
+            if rows_with_dark_runs >= 5:
+                return True
+                
+        except Exception:
+            pass
+        
+        return False
+    
     def _check_text_anomalies(self, text: str, doc_type: str):
         """Check extracted text for anomalies."""
         text_lower = text.lower()
         
+        # Note: Redaction detection now happens earlier in analyze() before creator tool check
+        
         # Check for placeholder text that wasn't replaced
-        placeholders = ['lorem ipsum', 'xxx-xx-xxxx', 'john doe', 'jane doe', 
+        # Note: xxx-xx-xxxx removed - that's a legitimate SSN redaction, not a placeholder
+        placeholders = ['lorem ipsum', 'john doe', 'jane doe', 
                        '[company name]', '[employee name]', 'sample', 'example',
                        'test document', 'draft']
         for placeholder in placeholders:
