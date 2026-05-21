@@ -125,6 +125,24 @@ Showing only 1-3 digits is unusual and could indicate:
 
 **Reference:** IRS Pub 1586 - Truncated Taxpayer Identification Numbers
 
+### W-2 and 1099 Year Styling
+On official IRS W-2 and 1099 forms, the **tax year is displayed larger and bolder** than the surrounding text. This is a deliberate design feature.
+
+**What to look for:**
+- The year (e.g., "2025") should be prominently styled
+- It should be noticeably larger than field labels and values
+- It should be bolder/heavier weight than other text
+
+**Suspicious indicators:**
+- Year appears in same size/weight as other text
+- Year looks like it was typed in rather than printed as part of form
+- Year font doesn't match the rest of the form
+
+If the year is NOT larger/bolder, this suggests:
+1. A template document (someone recreated the form)
+2. A modified/fabricated document
+3. An unofficial reproduction
+
 ### Legitimate Redactions
 Candidates may be asked to redact certain information for privacy/compliance:
 - Bank account numbers (partial redaction OK)

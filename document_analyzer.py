@@ -1283,6 +1283,7 @@ ANALYZE FOR:
    - Look for dates where the font color or darkness differs from surrounding text
    - Check if year digits appear misaligned or at different baselines
    - Look for any rectangular areas that seem to cover/redact original content
+   - **W-2/1099 SPECIFIC**: The tax year on official IRS forms (W-2, 1099) is displayed LARGER and BOLDER than the rest of the text. If the year appears in the same size/weight as other text, this is suspicious - it may be a template or fabricated form.
 
 3. **Invalid Field Values**
    - Check for "N/A", "Not Needed", "None", or similar text in boxes that should contain numbers or be blank
@@ -1316,7 +1317,9 @@ RESPOND IN THIS JSON FORMAT:
     }},
     "date_year_tampering": {{
         "detected": true/false,
-        "issues": ["describe any year/date tampering: overprints, covered text, font differences in dates"]
+        "issues": ["describe any year/date tampering: overprints, covered text, font differences in dates"],
+        "year_styling_correct": true/false,
+        "year_styling_notes": "For W-2/1099: Is the tax year displayed larger/bolder than other text as on official IRS forms? Note if missing or incorrect."
     }},
     "invalid_field_values": {{
         "detected": true/false,
@@ -1421,6 +1424,17 @@ RESPOND IN THIS JSON FORMAT:
                                 'critical',
                                 35
                             )
+                    
+                    # Check W-2/1099 year styling (should be larger/bolder)
+                    if doc_type in ['W-2', '1099'] and date_check.get('year_styling_correct') == False:
+                        year_notes = date_check.get('year_styling_notes', 'Tax year does not appear in larger/bolder font as expected on official IRS forms.')
+                        self._add_flag(
+                            'Tax Year Styling Incorrect',
+                            f'{year_notes} On official W-2 and 1099 forms, the tax year is displayed larger and bolder than other text. '
+                            'This discrepancy may indicate a template or fabricated document.',
+                            'warning',
+                            20
+                        )
                     
                     # Add invalid field value flags from AI
                     invalid_check = ai_result.get('invalid_field_values', {})
