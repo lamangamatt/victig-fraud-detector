@@ -121,9 +121,9 @@ with st.sidebar:
     
     st.header("🎯 Risk Levels")
     st.markdown("""
-    🔴 **HIGH** (50+) - Strong fraud indicators  
-    🟡 **MEDIUM** (25-49) - Suspicious, needs review  
-    🟢 **LOW** (0-24) - Appears legitimate
+    🔴 **HIGH** (65+) - Strong fraud indicators  
+    🟡 **MEDIUM** (35-64) - Suspicious, needs review  
+    🟢 **LOW** (0-34) - Appears legitimate
     """)
     
     st.divider()
@@ -244,9 +244,9 @@ if page == "📖 About & Methodology":
     | ✅ Positive | -10 to -15 | Legitimate payroll software detected, AI confirms authenticity |
     
     **Final Risk Levels:**
-    - 🔴 **HIGH (50+):** Strong fraud indicators — request alternative documentation
-    - 🟡 **MEDIUM (25-49):** Suspicious elements — additional verification recommended  
-    - 🟢 **LOW (0-24):** Appears legitimate — standard review sufficient
+    - 🔴 **HIGH (65+):** Strong fraud indicators — request alternative documentation
+    - 🟡 **MEDIUM (35-64):** Suspicious elements — additional verification recommended  
+    - 🟢 **LOW (0-34):** Appears legitimate — standard review sufficient
     """)
     
     st.divider()

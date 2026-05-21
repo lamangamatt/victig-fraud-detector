@@ -67,8 +67,9 @@ class DocumentAnalyzer:
     }
     
     # Suspicious creation tools - weighted by risk
+    # Scores reduced 2026-05-21 to reduce false positives from common legitimate scenarios
     SUSPICIOUS_CREATORS = {
-        # High risk - image editors
+        # High risk - image editors (these are genuinely suspicious)
         'photoshop': ('Adobe Photoshop', 45),
         'gimp': ('GIMP', 40),
         'illustrator': ('Adobe Illustrator', 40),
@@ -77,28 +78,28 @@ class DocumentAnalyzer:
         'pixelmator': ('Pixelmator', 35),
         'paint.net': ('Paint.NET', 30),
         
-        # Medium risk - document editors
-        'canva': ('Canva', 35),
-        'microsoft word': ('Microsoft Word', 25),
-        'libreoffice': ('LibreOffice', 25),
-        'openoffice': ('OpenOffice', 25),
-        'pages': ('Apple Pages', 20),
-        'google docs': ('Google Docs', 20),
+        # Medium risk - document editors (reduced - HR legitimately uses these)
+        'canva': ('Canva', 30),
+        'microsoft word': ('Microsoft Word', 12),  # Reduced from 25 - HR uses Word
+        'libreoffice': ('LibreOffice', 15),
+        'openoffice': ('OpenOffice', 15),
+        'pages': ('Apple Pages', 12),
+        'google docs': ('Google Docs', 12),
         
         # PDF editors - medium-high risk
-        'acrobat pro': ('Adobe Acrobat Pro', 30),
+        'acrobat pro': ('Adobe Acrobat Pro', 20),  # Reduced - sometimes used legitimately
         'pdf editor': ('PDF Editor', 35),
-        'foxit': ('Foxit PDF', 25),
-        'nitro': ('Nitro PDF', 25),
+        'foxit': ('Foxit PDF', 20),
+        'nitro': ('Nitro PDF', 20),
         'smallpdf': ('SmallPDF', 30),
         'ilovepdf': ('iLovePDF', 30),
         'sejda': ('Sejda', 30),
-        'pdf-xchange': ('PDF-XChange', 25),
-        'pdfelement': ('PDFelement', 30),
+        'pdf-xchange': ('PDF-XChange', 20),
+        'pdfelement': ('PDFelement', 25),
         
-        # Lower risk - common tools that could be legitimate
-        'preview': ('macOS Preview', 15),
-        'microsoft print': ('Microsoft Print to PDF', 10),
+        # Low/no risk - common legitimate tools
+        'preview': ('macOS Preview', 5),  # Reduced from 15 - just scanning
+        'microsoft print': ('Microsoft Print to PDF', 0),  # Reduced from 10 - completely normal
     }
     
     # AI-related indicators - highest risk
@@ -378,9 +379,9 @@ class DocumentAnalyzer:
         if not creator and not producer:
             self._add_flag(
                 'Metadata Missing',
-                'Document metadata has been stripped or is missing. Legitimate payroll systems always include creator information.',
-                'warning',
-                20
+                'Document metadata has been stripped or is missing. This is common with scanned documents but can also indicate tampering.',
+                'info',
+                10  # Reduced from 20 - too common with legitimate scans
             )
         
         # Check for JavaScript in PDF
@@ -397,9 +398,9 @@ class DocumentAnalyzer:
         if size_bytes < 5000:  # Less than 5KB
             self._add_flag(
                 'Unusually Small File',
-                f'File is only {size_bytes/1024:.1f}KB. Legitimate scanned documents are typically larger.',
-                'warning',
-                15
+                f'File is only {size_bytes/1024:.1f}KB. This could indicate a digitally created document rather than a scan.',
+                'info',
+                8  # Reduced from 15 - small files can be legitimate
             )
         elif size_bytes > 10000000:  # More than 10MB
             self._add_flag(
@@ -531,7 +532,7 @@ class DocumentAnalyzer:
                     f'Legitimate Source: {legit_name}',
                     f'Document appears to originate from {legit_name} payroll system.',
                     'info',
-                    -15
+                    -25  # Increased bonus from -15 - legitimate sources should offset other flags
                 )
                 return
     
@@ -1257,11 +1258,11 @@ RESPOND IN THIS JSON FORMAT:
         critical_flags = [f for f in flags if f.get('severity') == 'critical']
         warning_flags = [f for f in flags if f.get('severity') == 'warning']
         
-        if risk_score >= 50 or len(critical_flags) >= 2:
+        if risk_score >= 65 or len(critical_flags) >= 2:
             recommendations.append("⛔ HIGH RISK: Request alternative documentation or direct employer verification")
             recommendations.append("📞 Contact the employer directly using independently verified contact information")
             recommendations.append("🔍 Request original documents if only copies were provided")
-        elif risk_score >= 25 or len(critical_flags) >= 1:
+        elif risk_score >= 35 or len(critical_flags) >= 1:
             recommendations.append("⚠️ ELEVATED RISK: Additional verification recommended")
             recommendations.append("📋 Cross-reference with other provided documents")
             recommendations.append("📞 Consider direct employer verification for this candidate")
@@ -1291,10 +1292,16 @@ RESPOND IN THIS JSON FORMAT:
         self.risk_score += score_impact
     
     def _calculate_risk_level(self, score: int) -> str:
-        """Calculate overall risk level from score."""
-        if score >= 50:
+        """Calculate overall risk level from score.
+        
+        Thresholds adjusted 2026-05-21 to reduce false positives:
+        - HIGH: 65+ (was 50) - Strong fraud indicators
+        - MEDIUM: 35-64 (was 25-49) - Needs review
+        - LOW: 0-34 (was 0-24) - Appears legitimate
+        """
+        if score >= 65:
             return 'HIGH'
-        elif score >= 25:
+        elif score >= 35:
             return 'MEDIUM'
         else:
             return 'LOW'
