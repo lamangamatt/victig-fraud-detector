@@ -1269,12 +1269,28 @@ CONTEXT:
 
 ANALYZE FOR:
 
-1. **Font Consistency** (CRITICAL - Common fraud indicator)
-   - Are ALL fonts consistent throughout the document? Check EVERY text element.
-   - Look for font mismatches in: dates, years, dollar amounts, names, addresses
-   - Check if any text appears darker, bolder, or in a different typeface than surrounding text
-   - Look for text that appears to have been added later (different font weight, size, or style)
-   - Check if numbers in the same column use different fonts
+1. **Font Consistency** (Only flag when combined with other indicators)
+   IMPORTANT: These documents are commonly scanned, photocopied, or exported as PDFs,
+   which NATURALLY produces font-weight variation, slight typeface differences, and
+   inconsistent rendering quality. Font variation ALONE is NOT evidence of fraud.
+
+   ACCEPTABLE variation (do NOT flag):
+   - Differences in font weight between headers and body text
+   - Slightly darker or lighter text due to scanning or photocopying
+   - Mixed clarity between sections of the same document
+   - PDFs generated from payroll systems vs. scanned copies
+   - Slight differences in typeface or rendering quality from reproduction
+
+   ONLY flag font-related issues when combined with at least one other indicator:
+   - Mismatched employer names or EIN inconsistencies
+   - Altered numbers (income, wages, taxes) that do not align across fields
+   - Misaligned totals or inconsistent arithmetic
+   - Signs of digital editing (cut/paste artifacts, layering, overwriting text)
+   - Different font styles used within the SAME numeric field or line item in a
+     suspicious way (not just general document variation between sections)
+
+   Treat font differences as a formatting artifact of reproduction, NOT a fraud
+   signal, unless supported by substantive inconsistencies in the data itself.
 
 2. **Year/Date Tampering** (CRITICAL - Very common on fake W-2s)
    - Is the tax year clearly visible and in the same font as other text?
@@ -1313,7 +1329,8 @@ RESPOND IN THIS JSON FORMAT:
     "confidence": 0-100,
     "font_consistency": {{
         "consistent": true/false,
-        "issues": ["describe each font mismatch found - location and nature of mismatch"]
+        "issues": ["only list font issues that are corroborated by other fraud indicators (data inconsistencies, digital editing signs, etc). Do NOT list scan/photocopy artifacts."],
+        "corroborating_indicators": ["list the OTHER fraud indicators that support each font flag (e.g., 'altered numbers in same field', 'mismatched EIN'). If empty, do not flag font issues."]
     }},
     "date_year_tampering": {{
         "detected": true/false,
@@ -1401,17 +1418,22 @@ RESPOND IN THIS JSON FORMAT:
                             -10
                         )
                     
-                    # Add font consistency flags
+                    # Add font consistency flags - only when corroborated by other indicators
+                    # (per Trish Gustin feedback June 2026: scanning/photocopying naturally
+                    # produces font variation; flag only when other fraud signals support it)
                     font_check = ai_result.get('font_consistency', {})
                     if font_check.get('consistent') == False:
                         font_issues = font_check.get('issues', [])
-                        for issue in font_issues[:3]:
-                            self._add_flag(
-                                'Font Mismatch Detected',
-                                issue,
-                                'critical',
-                                25
-                            )
+                        corroborating = font_check.get('corroborating_indicators', [])
+                        # Only flag if AI provided corroborating indicators
+                        if corroborating and font_issues:
+                            for issue in font_issues[:3]:
+                                self._add_flag(
+                                    'Font Mismatch with Corroborating Indicators',
+                                    f"{issue} (supported by: {', '.join(corroborating[:2])})",
+                                    'warning',
+                                    10
+                                )
                     
                     # Add date/year tampering flags
                     date_check = ai_result.get('date_year_tampering', {})
