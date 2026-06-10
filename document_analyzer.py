@@ -1,6 +1,21 @@
 """
-Document Analyzer v2.0
+Document Analyzer v2.2
 Enhanced fraud detection with AI vision analysis for employment documents.
+
+v2.2 Updates (April 30, 2026):
+- Added grayscale variance detection to catch "printed over template" fraud
+- Detects inconsistent text darkness (multiple print passes)
+- Detects bimodal darkness patterns (template overlay indicator)
+
+v2.1 Updates (April 2026 - based on Myssy Clayson's input):
+- Added future-dated document detection for W-2s and 1099s
+- Added 87-prefix EIN flagging (high fraud risk)
+- Added EIN geographic mismatch detection
+- Enhanced invalid field value detection ("NOT NEEDED", etc.)
+- Added Box 14 code validation
+- Added employer name formatting checks
+- Added 1099 bulk filing platform detection
+- Added random account number pattern detection
 """
 
 import os
@@ -128,6 +143,45 @@ class DocumentAnalyzer:
         r'account.*x{4}',      # Redacted account number
         r'x{4}\d{4}',          # Last 4 of account visible
     ]
+
+    # EIN state prefix mapping (historical assignments)
+    # Note: Online applications can get any prefix, but mismatches are still suspicious
+    EIN_STATE_PREFIXES = {
+        '01': ['AL'], '02': ['AL'], '03': ['FL'], '04': ['FL'], '05': ['FL'], '06': ['FL'],
+        '10': ['GA'], '11': ['GA'], '12': ['GA'],
+        '13': ['SC'], '14': ['SC'], '15': ['MS'], '16': ['MS'],
+        '20': ['VA'], '21': ['VA'], '22': ['VA'], '23': ['WV'], '24': ['NC'], '25': ['NC'],
+        '26': ['DE'], '27': ['MD'], '28': ['MD'], '29': ['DC'],
+        '30': ['WI'], '31': ['WI'], '32': ['WI'], '33': ['IN'], '34': ['IN'], '35': ['KY'],
+        '36': ['IL', 'IN'],  # Shared prefix
+        '37': ['MI'], '38': ['MI'], '39': ['OH'], '40': ['OH'], '41': ['OH'],
+        '42': ['TN'], '43': ['TN'], '44': ['OK'], '45': ['OK'],
+        '46': ['KS'], '47': ['IA'], '48': ['MN'], '49': ['NE'],
+        '50': ['ND'], '51': ['SD'], '52': ['MT'], '53': ['ID'], '54': ['WY'],
+        '55': ['CO'], '56': ['CO'], '57': ['AZ'], '58': ['NM'], '59': ['UT'], '60': ['NV'],
+        '61': ['CA'], '62': ['CA'], '63': ['CA'], '64': ['CA'], '65': ['CA'], '66': ['CA'],
+        '67': ['OR'], '68': ['WA'], '69': ['AK'], '70': ['HI'],
+        '71': ['AR'], '72': ['AR'], '73': ['LA'], '74': ['TX'], '75': ['TX'], '76': ['TX'],
+        '77': ['MO'], '78': ['MO'],
+        '80': ['NY'], '81': ['NY'], '82': ['NY'], '83': ['NY'], '84': ['NY'], '85': ['NY'],
+        '86': ['NY'], '87': ['ONLINE'],  # IRS online applications - HIGH FRAUD RISK
+        '88': ['ONLINE'],  # IRS online applications - HIGH FRAUD RISK
+        '90': ['CT'], '91': ['RI'], '92': ['NJ'], '93': ['PA'], '94': ['PA'], '95': ['PA'],
+        '98': ['MA'], '99': ['ME', 'VT', 'NH'],
+    }
+    
+    # Known valid Box 14 codes (W-2)
+    KNOWN_BOX14_CODES = {
+        # Standard IRS codes
+        'A', 'B', 'C', 'D', 'DD', 'E', 'EE', 'F', 'FF', 'G', 'GG', 'H', 'HH',
+        'J', 'K', 'L', 'M', 'N', 'P', 'Q', 'R', 'S', 'T', 'V', 'W', 'Y', 'Z',
+        'AA', 'BB', 'CC',
+        # Common employer-reported items (text labels)
+        'UNION', 'DUES', 'RETIRE', '401K', '401(K)', '403B', '457', 'PENSION',
+        'MEDICAL', 'DENTAL', 'VISION', 'HSA', 'FSA', 'LIFE', 'LTD', 'STD',
+        'HEALTH', 'INSURANCE', 'PARKING', 'TRANSIT', 'EDUC', 'TUITION',
+        'ROTH', 'SIMPLE', 'SEP', 'ERISA',
+    }
     
     # AI-related indicators - highest risk
     AI_INDICATORS = [
@@ -216,10 +270,22 @@ class DocumentAnalyzer:
             results['extracted_data'] = self._extract_document_data(text, doc_type)
             self._check_text_anomalies(text, doc_type)  # Runs additional text checks
             
+            # NEW: Validate EIN and employer info if extracted
+            extracted = results['extracted_data']
+            if extracted.get('ein'):
+                self._check_ein_validity(
+                    extracted.get('ein'),
+                    extracted.get('employer_state'),
+                    extracted.get('employer_name')
+                )
+            
             if doc_type == "Pay Stub":
                 results['math_validation'] = self._validate_pay_stub_math(text, results['extracted_data'])
             elif doc_type == "W-2":
                 results['math_validation'] = self._validate_w2_math(text, results['extracted_data'])
+            elif doc_type == "1099":
+                # NEW: 1099 specific validation
+                results['math_validation'] = self._validate_1099(text, results['extracted_data'])
         
         # Visual/forensic analysis
         if image:
@@ -790,8 +856,10 @@ class DocumentAnalyzer:
                 break
         
         # Check for invalid text in fields that should be numeric or blank
+        # ENHANCED: Added more invalid values based on real fraud samples
         invalid_field_values = ['n/a', 'not needed', 'not applicable', 'none', 'na', 'n.a.', 
-                                'see attached', 'refer to', 'tbd', 'pending']
+                                'see attached', 'refer to', 'tbd', 'pending', 'not required',
+                                'exempt', 'waived', 'n/d', 'nd']
         for invalid_val in invalid_field_values:
             # Look for these near dollar signs, box numbers, or common W2/pay stub fields
             patterns = [
@@ -802,6 +870,8 @@ class DocumentAnalyzer:
                 rf'gross[:\s]*{re.escape(invalid_val)}',
                 rf'net[:\s]*{re.escape(invalid_val)}',
                 rf'withholding[:\s]*{re.escape(invalid_val)}',
+                rf'state\s*(?:id|employer)[:\s]*{re.escape(invalid_val)}',  # NEW: State ID field
+                rf'employer\s*(?:state)?\s*id[:\s]*{re.escape(invalid_val)}',  # NEW
             ]
             for pattern in patterns:
                 if re.search(pattern, text_lower):
@@ -813,6 +883,35 @@ class DocumentAnalyzer:
                     )
                     break
         
+        # NEW: Check for future-dated tax documents (critical fraud indicator)
+        current_year = datetime.now().year
+        current_month = datetime.now().month
+        
+        if doc_type in ["W-2", "1099"]:
+            # Find all 4-digit years in the document
+            years_found = re.findall(r'\b(20[2-9]\d)\b', text)
+            for year_str in years_found:
+                doc_year = int(year_str)
+                # A W-2 or 1099 for the current year shouldn't exist until January of the next year
+                # (or late December at earliest)
+                if doc_year > current_year:
+                    self._add_flag(
+                        'Future-Dated Document',
+                        f'Document references tax year {doc_year}, but current year is {current_year}. Future-dated tax documents are impossible and indicate fabrication.',
+                        'critical',
+                        50
+                    )
+                    break
+                elif doc_year == current_year and current_month < 12:
+                    # Current year W-2/1099 before December is suspicious
+                    self._add_flag(
+                        'Premature Tax Year',
+                        f'Document shows tax year {doc_year}, but W-2s/1099s for the current year are typically not issued until year-end or early next year.',
+                        'warning',
+                        20
+                    )
+                    break
+        
         # Check for missing or suspicious year formats on W-2s
         if doc_type == "W-2":
             # Look for tax year - should be prominently displayed
@@ -820,7 +919,6 @@ class DocumentAnalyzer:
             year_match = re.search(year_pattern, text_lower)
             
             # Check if year is missing entirely
-            current_year = datetime.now().year
             valid_years = [str(y) for y in range(current_year - 5, current_year + 1)]
             has_valid_year = any(year in text for year in valid_years)
             
@@ -831,6 +929,9 @@ class DocumentAnalyzer:
                     'critical',
                     40
                 )
+            
+            # NEW: Check Box 14 codes for validity
+            self._check_box14_codes(text)
         
         # Check for inconsistent date formats
         date_patterns = [
@@ -866,6 +967,129 @@ class DocumentAnalyzer:
                 )
                 break
     
+    def _check_box14_codes(self, text: str):
+        """Validate Box 14 codes on W-2 forms."""
+        # Look for Box 14 entries
+        box14_pattern = r'box\s*14[^\n]*?([A-Z0-9]{2,10})\s+[\d,\.]+'
+        matches = re.findall(box14_pattern, text, re.I)
+        
+        for code in matches:
+            code_upper = code.upper()
+            # Check if it's a known valid code
+            is_valid = (
+                code_upper in self.KNOWN_BOX14_CODES or
+                any(known in code_upper for known in self.KNOWN_BOX14_CODES)
+            )
+            
+            # Check if it looks like a random alphanumeric string (fraud indicator)
+            if not is_valid and len(code) >= 4:
+                # Random codes often have mixed letters and numbers with no pattern
+                has_vowels = any(c in code_upper for c in 'AEIOU')
+                has_consonants = any(c in code_upper for c in 'BCDFGHJKLMNPQRSTVWXYZ')
+                has_numbers = any(c.isdigit() for c in code)
+                
+                if has_numbers and has_consonants and len(code) >= 5:
+                    self._add_flag(
+                        'Suspicious Box 14 Code',
+                        f'Box 14 contains code "{code}" which is not a recognized payroll code and appears randomly generated.',
+                        'warning',
+                        15
+                    )
+    
+    def _check_ein_validity(self, ein: str, employer_state: str = None, employer_name: str = None):
+        """Validate EIN format and check for fraud indicators."""
+        if not ein:
+            return
+        
+        # Parse EIN prefix
+        parts = ein.split('-')
+        if len(parts) != 2:
+            return
+        
+        prefix = parts[0]
+        
+        # Check for high-risk 87/88 prefix (IRS online applications)
+        if prefix in ['87', '88']:
+            self._add_flag(
+                'High-Risk EIN Prefix',
+                f'EIN {ein} uses the {prefix}- prefix, which is assigned via IRS online applications. This prefix is frequently associated with fraudulent EINs.',
+                'warning',
+                20
+            )
+        
+        # Check geographic mismatch if we know the employer state
+        if employer_state and prefix in self.EIN_STATE_PREFIXES:
+            expected_states = self.EIN_STATE_PREFIXES[prefix]
+            if 'ONLINE' not in expected_states:
+                # Normalize state code
+                state_upper = employer_state.upper().strip()
+                state_abbrevs = {
+                    'ALABAMA': 'AL', 'ALASKA': 'AK', 'ARIZONA': 'AZ', 'ARKANSAS': 'AR',
+                    'CALIFORNIA': 'CA', 'COLORADO': 'CO', 'CONNECTICUT': 'CT', 'DELAWARE': 'DE',
+                    'FLORIDA': 'FL', 'GEORGIA': 'GA', 'HAWAII': 'HI', 'IDAHO': 'ID',
+                    'ILLINOIS': 'IL', 'INDIANA': 'IN', 'IOWA': 'IA', 'KANSAS': 'KS',
+                    'KENTUCKY': 'KY', 'LOUISIANA': 'LA', 'MAINE': 'ME', 'MARYLAND': 'MD',
+                    'MASSACHUSETTS': 'MA', 'MICHIGAN': 'MI', 'MINNESOTA': 'MN', 'MISSISSIPPI': 'MS',
+                    'MISSOURI': 'MO', 'MONTANA': 'MT', 'NEBRASKA': 'NE', 'NEVADA': 'NV',
+                    'NEW HAMPSHIRE': 'NH', 'NEW JERSEY': 'NJ', 'NEW MEXICO': 'NM', 'NEW YORK': 'NY',
+                    'NORTH CAROLINA': 'NC', 'NORTH DAKOTA': 'ND', 'OHIO': 'OH', 'OKLAHOMA': 'OK',
+                    'OREGON': 'OR', 'PENNSYLVANIA': 'PA', 'RHODE ISLAND': 'RI', 'SOUTH CAROLINA': 'SC',
+                    'SOUTH DAKOTA': 'SD', 'TENNESSEE': 'TN', 'TEXAS': 'TX', 'UTAH': 'UT',
+                    'VERMONT': 'VT', 'VIRGINIA': 'VA', 'WASHINGTON': 'WA', 'WEST VIRGINIA': 'WV',
+                    'WISCONSIN': 'WI', 'WYOMING': 'WY', 'DISTRICT OF COLUMBIA': 'DC',
+                }
+                
+                if state_upper in state_abbrevs:
+                    state_upper = state_abbrevs[state_upper]
+                elif len(state_upper) > 2:
+                    state_upper = state_upper[:2]  # Try first two chars
+                
+                if state_upper not in expected_states:
+                    self._add_flag(
+                        'EIN Geographic Mismatch',
+                        f'EIN prefix {prefix} is historically assigned to {expected_states}, but employer is in {employer_state}. While not impossible, this warrants verification.',
+                        'warning',
+                        15
+                    )
+        
+        # Check for suspicious employer name formatting
+        if employer_name:
+            self._check_employer_name(employer_name)
+    
+    def _check_employer_name(self, employer_name: str):
+        """Check employer/payer name for fraud indicators."""
+        if not employer_name:
+            return
+        
+        name_stripped = employer_name.strip()
+        
+        # Check for all lowercase (unprofessional, suggests hasty fabrication)
+        if name_stripped and name_stripped == name_stripped.lower() and len(name_stripped) > 3:
+            self._add_flag(
+                'Improper Business Name Format',
+                f'Payer/employer name "{name_stripped}" is entirely lowercase. Legitimate businesses use proper capitalization on tax documents.',
+                'warning',
+                10
+            )
+        
+        # Check for potentially random/nonsense names
+        # Look for strings with unusual consonant clusters or no vowels
+        words = re.findall(r'[A-Za-z]{4,}', name_stripped)
+        for word in words:
+            word_lower = word.lower()
+            vowels = sum(1 for c in word_lower if c in 'aeiou')
+            consonants = len(word_lower) - vowels
+            
+            # Flag words with very few vowels relative to length (unusual for English)
+            if len(word) >= 6 and vowels <= 1:
+                self._add_flag(
+                    'Unusual Employer Name',
+                    f'Employer name contains "{word}" which does not appear to be a standard English word. Verify this business exists.',
+                    'info',
+                    10
+                )
+                break
+    
     def _extract_document_data(self, text: str, doc_type: str) -> Dict:
         """Extract structured data from document text."""
         data = {}
@@ -875,9 +1099,29 @@ class DocumentAnalyzer:
         if ssn_match:
             data['ssn_last4'] = ssn_match.group(1)
         
-        ein_match = re.search(r'(?:EIN|Employer ID)[:\s]*(\d{2}-\d{7})', text, re.I)
+        ein_match = re.search(r'(?:EIN|Employer ID|Employer.s.*ID)[:\s]*(\d{2}-\d{7})', text, re.I)
         if ein_match:
             data['ein'] = ein_match.group(1)
+        
+        # NEW: Extract employer/payer name (for validation)
+        # Try various patterns to find employer name
+        employer_patterns = [
+            r'(?:employer|payer)[\s\']*s?\s*name[:\s]*([^\n]{3,50})',
+            r'(?:from|payer)[:\s]*\n?\s*([A-Z][^\n]{2,50})',  # Capitalized name after "From" or "Payer"
+            r'(?:company|business)\s*name[:\s]*([^\n]{3,50})',
+        ]
+        for pattern in employer_patterns:
+            emp_match = re.search(pattern, text, re.I)
+            if emp_match:
+                data['employer_name'] = emp_match.group(1).strip()
+                break
+        
+        # NEW: Extract state from employer address
+        # Look for 2-letter state codes in address patterns
+        state_pattern = r',\s*([A-Z]{2})\s+\d{5}'
+        state_match = re.search(state_pattern, text)
+        if state_match:
+            data['employer_state'] = state_match.group(1)
         
         # Extract all money amounts
         amounts = re.findall(r'\$[\d,]+\.?\d*', text)
@@ -1135,6 +1379,54 @@ class DocumentAnalyzer:
         
         return result
     
+    def _validate_1099(self, text: str, data: Dict) -> Dict:
+        """Validate 1099 forms for fraud indicators."""
+        result = {'valid': True, 'checks': [], 'errors': []}
+        
+        text_lower = text.lower()
+        
+        # Extract 1099 specific data
+        nec_match = re.search(r'(?:box\s*1|nonemployee\s*compensation)[:\s]*\$?([\d,]+\.?\d*)', text, re.I)
+        if nec_match:
+            try:
+                compensation = float(nec_match.group(1).replace(',', ''))
+                data['nonemployee_compensation'] = compensation
+                result['checks'].append(f'Compensation: ${compensation:,.2f}')
+            except:
+                pass
+        
+        # Check for bulk filing platform indicators
+        bulk_filing_indicators = ['tax1099.com', 'track1099', 'efile4biz', '1099-etc']
+        for indicator in bulk_filing_indicators:
+            if indicator in text_lower:
+                self._add_flag(
+                    'Bulk E-Filing Platform',
+                    f'Document appears to have been filed through {indicator}. While legitimate, these platforms have minimal payer identity verification.',
+                    'info',
+                    5
+                )
+                break
+        
+        # Check for random alphanumeric account numbers (common in fraud)
+        account_match = re.search(r'account\s*(?:number|#|no\.?)?[:\s]*([A-Z0-9]{8,14})', text, re.I)
+        if account_match:
+            account_num = account_match.group(1)
+            # Check if it looks randomly generated (mix of letters and numbers, no pattern)
+            has_letters = any(c.isalpha() for c in account_num)
+            has_numbers = any(c.isdigit() for c in account_num)
+            if has_letters and has_numbers and len(account_num) >= 10:
+                self._add_flag(
+                    'Random Account Number Pattern',
+                    f'Account number "{account_num}" appears randomly generated. This pattern is common with bulk e-filing platforms used in fraud schemes.',
+                    'info',
+                    5
+                )
+        
+        # Check for multiple payers from same address (requires session tracking)
+        # This would need to be implemented at a higher level for batch analysis
+        
+        return result
+    
     def _analyze_visual_forensics(self, image: Image.Image) -> Dict:
         """Perform visual forensic analysis on the document image."""
         results = {
@@ -1205,22 +1497,93 @@ class DocumentAnalyzer:
             if edge_intensity > 30:
                 results['anomalies'].append('High edge intensity detected')
             
-            # Check 5: Noise analysis
-            results['checks_performed'].append('Noise pattern analysis')
+            # Check 5: Noise analysis (requires scipy)
+            try:
+                results['checks_performed'].append('Noise pattern analysis')
+                
+                # Look for uniform noise (natural) vs irregular noise (edited)
+                small = image.resize((100, 140))
+                small_array = np.array(small.convert('L'), dtype=float)
+                
+                # Calculate local variance
+                from scipy import ndimage
+                local_var = ndimage.generic_filter(small_array, np.var, size=5)
+                var_of_var = np.var(local_var)
+                results['noise_uniformity'] = round(var_of_var, 2)
+            except ImportError:
+                # scipy not available, skip noise analysis
+                pass
             
-            # Look for uniform noise (natural) vs irregular noise (edited)
-            small = image.resize((100, 140))
-            small_array = np.array(small.convert('L'), dtype=float)
+            # Check 6: Grayscale variance detection (NEW - catches "printed over template" fraud)
+            # When documents are printed multiple times or text is overlaid on templates,
+            # the text appears in different shades of black/gray
+            results['checks_performed'].append('Grayscale variance analysis')
             
-            # Calculate local variance
-            from scipy import ndimage
-            local_var = ndimage.generic_filter(small_array, np.var, size=5)
-            var_of_var = np.var(local_var)
-            results['noise_uniformity'] = round(var_of_var, 2)
+            gray_array = np.array(gray, dtype=float)
             
-        except ImportError:
-            # scipy not available, skip advanced analysis
-            pass
+            # Find dark pixels (text regions) - threshold at 180 to catch text
+            dark_mask = gray_array < 180
+            if np.sum(dark_mask) > 100:  # Need minimum text pixels
+                dark_pixels = gray_array[dark_mask]
+                
+                # Calculate statistics on text darkness
+                text_mean = np.mean(dark_pixels)
+                text_std = np.std(dark_pixels)
+                text_min = np.min(dark_pixels)
+                text_max = np.max(dark_pixels)
+                darkness_range = text_max - text_min
+                
+                results['text_darkness'] = {
+                    'mean': round(text_mean, 1),
+                    'std': round(text_std, 1),
+                    'range': round(darkness_range, 1),
+                    'min': round(text_min, 1),
+                    'max': round(text_max, 1)
+                }
+                
+                # High standard deviation in text darkness indicates multiple print passes
+                # Legitimate single-pass prints have consistent ink density
+                # Calibrated against Myssy's samples: legit=50.1, fraud=51-59
+                if text_std > 55:
+                    self._add_flag(
+                        'Inconsistent Text Darkness',
+                        f'Text appears in multiple shades of black (std dev: {text_std:.1f}). '
+                        f'This pattern often indicates printing over an existing template or multiple print passes.',
+                        'warning',
+                        20
+                    )
+                    results['anomalies'].append('Multiple ink densities detected')
+                elif text_std > 50:
+                    # Borderline - note but don't heavily penalize
+                    self._add_flag(
+                        'Slightly Elevated Text Variance',
+                        f'Text darkness shows moderate variation (std dev: {text_std:.1f}). '
+                        f'Worth reviewing but may be normal scanning artifacts.',
+                        'info',
+                        5
+                    )
+                
+                # Also check for bimodal distribution (two distinct darkness levels)
+                # This is a stronger indicator of template overlay
+                # Only flag if std is already elevated AND we have true bimodal pattern
+                if darkness_range > 100 and text_std > 52:
+                    # Look for clustering - if there are two distinct groups of dark values
+                    dark_text = dark_pixels[dark_pixels < 60]  # Very dark (original template text)
+                    medium_text = dark_pixels[(dark_pixels >= 60) & (dark_pixels < 120)]  # Medium gray (added text)
+                    
+                    # Need substantial amounts of BOTH to indicate overlay
+                    if len(dark_text) > 100 and len(medium_text) > 100:
+                        dark_ratio = len(medium_text) / len(dark_text)
+                        if 0.3 < dark_ratio < 4:  # Both groups are substantial
+                            self._add_flag(
+                                'Bimodal Text Darkness Pattern',
+                                f'Document contains two distinct levels of text darkness '
+                                f'(dark: {len(dark_text)} px, medium: {len(medium_text)} px). '
+                                f'This is a strong indicator of text being overlaid on an existing form.',
+                                'critical',
+                                30
+                            )
+                            results['anomalies'].append('Bimodal darkness distribution (template overlay likely)')
         except Exception as e:
             results['error'] = str(e)
         
