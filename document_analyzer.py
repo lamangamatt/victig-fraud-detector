@@ -1,6 +1,11 @@
 """
-Document Analyzer v2.2
+Document Analyzer v2.3
 Enhanced fraud detection with AI vision analysis for employment documents.
+
+v2.3 Updates (June 19, 2026 - based on Myssy Clayson's input):
+- Added structural box-numbering checks (e.g., three "13" boxes without a/b/c suffixes)
+- Added overlapping text / collision detection inside form fields
+- AI vision prompt now explicitly validates official W-2/1099 box layout
 
 v2.2 Updates (April 30, 2026):
 - Added grayscale variance detection to catch "printed over template" fraud
@@ -1686,6 +1691,36 @@ ANALYZE FOR:
    - Different quality/resolution in different areas of the document?
    - White or colored rectangles that might be covering original content?
 
+7. **Box Numbering & Form Structure** (CRITICAL for W-2 / 1099)
+   Official IRS forms have a STRICT layout. Deviations are strong fraud indicators.
+   - **W-2 Box 12**: Must be split into 12a, 12b, 12c, 12d (four separate rows, each
+     with its own letter suffix). Each row has a small "Code" field and an amount.
+   - **W-2 Box 13**: A SINGLE box containing THREE CHECKBOXES (Statutory employee,
+     Retirement plan, Third-party sick pay). It is NOT three separate rows.
+     - 🚨 If you see three rows each labeled "13" (without a/b/c suffixes), this is
+       a malformed/fabricated form. Genuine W-2s never label three separate rows
+       all as "13".
+     - 🚨 If a box is repeated (e.g., "13/13/13" or "14/14") without a/b/c/d
+       letter suffixes, flag it as a structural anomaly.
+   - **W-2 Box 14**: "Other" — typically one or two free-form lines.
+   - **1099**: Box numbers follow the official IRS form layout for the specific
+     1099 variant (NEC, MISC, etc.). Duplicate box numbers without suffixes are
+     a red flag.
+   - Compare against an authentic IRS form layout. Any duplicated box number
+     without proper a/b/c/d suffix is structurally invalid.
+
+8. **Overlapping Text / Field Collisions**
+   - Look for words that physically overlap or collide with checkboxes, borders,
+     or other form elements.
+   - Look for text that runs into or through checkbox shapes (e.g., a line of text
+     appearing to strike through or underline a checkbox).
+   - Look for text from one field bleeding into an adjacent field.
+   - Look for words within the same field that overlap each other (e.g., one word
+     printed on top of another).
+   - These collisions are almost never present on genuine system-generated W-2s
+     and strongly suggest the document was assembled from a template or edited
+     by hand.
+
 RESPOND IN THIS JSON FORMAT:
 {{
     "overall_assessment": "LIKELY_LEGITIMATE" | "SUSPICIOUS" | "LIKELY_FRAUDULENT",
@@ -1717,6 +1752,14 @@ RESPOND IN THIS JSON FORMAT:
     "manipulation_indicators": {{
         "detected": true/false,
         "indicators": ["list of specific indicators: blur, cut lines, rectangles covering text, etc."]
+    }},
+    "box_numbering_structure": {{
+        "valid": true/false,
+        "issues": ["list any structural box-numbering problems, e.g. 'Three rows labeled 13 without a/b/c suffixes — Box 13 should be a single box with three checkboxes', 'Duplicate Box 14 without suffix', etc."]
+    }},
+    "overlapping_text": {{
+        "detected": true/false,
+        "issues": ["list specific overlap/collision issues, e.g. 'Word \"employee\" collides with checkbox in Box 13', 'Text bleeding from Box 12 into Box 13'"]
     }},
     "key_findings": ["most important findings, max 5"],
     "recommendation": "brief recommendation for the reviewer"
@@ -1842,6 +1885,34 @@ RESPOND IN THIS JSON FORMAT:
                                 indicator,
                                 'critical',
                                 15
+                            )
+                    
+                    # Add box numbering / structural flags (NEW v2.3 - Myssy's request)
+                    # Catches things like three "13" boxes without a/b/c suffixes,
+                    # which a legitimate W-2 would never have.
+                    box_check = ai_result.get('box_numbering_structure', {})
+                    if box_check.get('valid') == False:
+                        box_issues = box_check.get('issues', [])
+                        for issue in box_issues[:3]:
+                            self._add_flag(
+                                'Invalid Box Numbering / Structure',
+                                f'{issue} Official IRS forms have a strict box layout; deviations strongly suggest fabrication or template editing.',
+                                'critical',
+                                35
+                            )
+                    
+                    # Add overlapping text / collision flags (NEW v2.3 - Myssy's request)
+                    # Genuine system-generated W-2s do not have words colliding with
+                    # checkboxes or other field elements.
+                    overlap_check = ai_result.get('overlapping_text', {})
+                    if overlap_check.get('detected'):
+                        overlap_issues = overlap_check.get('issues', [])
+                        for issue in overlap_issues[:3]:
+                            self._add_flag(
+                                'Overlapping Text Detected',
+                                f'{issue} Text overlapping form fields or checkboxes is rare on system-generated documents and suggests manual editing or template assembly.',
+                                'warning',
+                                20
                             )
                     
                     return {
