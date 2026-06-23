@@ -1721,6 +1721,28 @@ ANALYZE FOR:
      and strongly suggest the document was assembled from a template or edited
      by hand.
 
+9. **Form Lines Crossing Through Text** (CRITICAL)
+   - Look for horizontal/vertical lines, dashed lines, or perforation marks that
+     physically cut THROUGH numbers, letters, or words (not between rows).
+   - Pay special attention to the state tax row (boxes 15, 16, 17): does a dashed
+     or solid line cut through the State code (e.g. "MO"), Employer's state ID
+     number, or any dollar amounts in those boxes?
+   - On genuine W-2s, text sits cleanly inside fields. When a line crosses through
+     the middle of characters, it almost always means the text was overlaid on top
+     of the form image rather than rendered by a real payroll system.
+   - Report exact box numbers where this occurs.
+
+10. **Inconsistent or Missing Box Borders** (CRITICAL for W-2)
+    - Compare the border thickness/darkness/completeness of each box against its
+      neighbors.
+    - In the state tax row, box 15 must have the same complete border as boxes 16
+      and 17. If box 15 is missing its top border, has a noticeably lighter border,
+      or has a partial/broken border while 16 and 17 are intact, this is a strong
+      indicator that box 15 was edited or rebuilt over an original form.
+    - Also check the Box 12 a/b/c/d rows and Box 13 area for missing dividers or
+      borders that differ from the rest of the form.
+    - Report which specific box(es) have border anomalies.
+
 RESPOND IN THIS JSON FORMAT:
 {{
     "overall_assessment": "LIKELY_LEGITIMATE" | "SUSPICIOUS" | "LIKELY_FRAUDULENT",
@@ -1760,6 +1782,14 @@ RESPOND IN THIS JSON FORMAT:
     "overlapping_text": {{
         "detected": true/false,
         "issues": ["list specific overlap/collision issues, e.g. 'Word \"employee\" collides with checkbox in Box 13', 'Text bleeding from Box 12 into Box 13'"]
+    }},
+    "lines_crossing_text": {{
+        "detected": true/false,
+        "issues": ["list each instance of a form line cutting through text, with box numbers, e.g. 'Dashed perforation line crosses through Employer state ID 14244519 in Box 15', 'Horizontal line cuts through MO state code'"]
+    }},
+    "box_border_anomalies": {{
+        "detected": true/false,
+        "issues": ["list each box with missing, lighter, or broken borders compared to neighbors, e.g. 'Box 15 missing top border while Boxes 16 and 17 are intact'"]
     }},
     "key_findings": ["most important findings, max 5"],
     "recommendation": "brief recommendation for the reviewer"
@@ -1911,6 +1941,31 @@ RESPOND IN THIS JSON FORMAT:
                             self._add_flag(
                                 'Overlapping Text Detected',
                                 f'{issue} Text overlapping form fields or checkboxes is rare on system-generated documents and suggests manual editing or template assembly.',
+                                'warning',
+                                20
+                            )
+                    
+                    # Lines crossing through text (NEW v2.4 - Myssy's St. Luke's W-2 feedback)
+                    # Perforation/form lines should NEVER cut through characters on a
+                    # real system-generated W-2.
+                    lines_check = ai_result.get('lines_crossing_text', {})
+                    if lines_check.get('detected'):
+                        for issue in lines_check.get('issues', [])[:3]:
+                            self._add_flag(
+                                'Form Line Crosses Through Text',
+                                f'{issue} Form lines or perforation marks cutting through characters strongly suggest the text was overlaid on top of the form image rather than rendered by a payroll system.',
+                                'critical',
+                                30
+                            )
+                    
+                    # Inconsistent / missing box borders (NEW v2.4)
+                    # Genuine W-2s have uniform borders across all boxes in a row.
+                    border_check = ai_result.get('box_border_anomalies', {})
+                    if border_check.get('detected'):
+                        for issue in border_check.get('issues', [])[:3]:
+                            self._add_flag(
+                                'Inconsistent Box Borders',
+                                f'{issue} Genuine W-2s have uniform border weight across boxes in the same row; missing or lighter borders suggest the box was rebuilt or edited.',
                                 'warning',
                                 20
                             )
