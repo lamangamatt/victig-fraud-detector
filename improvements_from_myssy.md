@@ -270,3 +270,54 @@ Use Myssy's samples to validate:
 - Tax1099.com and similar platforms are legitimate but exploitable - note their presence without over-flagging
 
 *Document prepared by Molesley based on Myssy Clayson's input, April 30, 2026*
+
+---
+
+## 2026-07-03 Changes — Myssy Clayson Forgery Sample
+
+### Background
+Myssy forwarded a real-world forged W-2 JPEG (two W-2s on one page, "Aretha L Hall", 2020)
+that the detector wrongly scored **10/100 LOW RISK**.  The form had:
+- Two W-2s (two employers: OUTREACH FAMILY SERVICES and LOYALTY HEALTHCARE BEHAVIORAL COUNS) on a single page
+- All monetary amounts written without cents (918, 360, 57, etc. instead of 918.00, 360.00)
+- Low wages ($360 and $918) with SS/Medicare withholding present
+- Blank Box 15 employer state ID despite state wages/tax amounts
+
+### New Detection Rules Added (document_analyzer.py)
+
+#### 1. Missing Decimal Formatting on Monetary Fields (CRITICAL, +40)
+Checks that at least 50% of detected monetary amounts have `.dd` cent formatting.
+IRS Publication 1141 requires two-digit cents on all W-2 dollar amounts.
+Forged W-2s created in word processors/image editors almost always omit this.
+
+#### 2. Multiple W-2 Forms on Single Page (WARNING, +25)
+Counts distinct EINs and employer-name block headers.
+Two or more on one page triggers the flag.
+
+#### 3. Implausibly Low Wages With Tax Withholding (WARNING, +20)
+Box 1 wages < $2,000 AND any withholding > $0.
+Workers at this income level are generally exempt from federal/state withholding.
+
+#### 4. Missing Employer State ID / Box 15 (WARNING, +15)
+State wages or state tax present but Box 15 (employer state ID) is blank.
+Fabricators often include state amounts without knowing the employer's state registration number.
+
+#### 5. Metadata Flag Upgrade for W-2 with Content Flags
+After all checks: if a W-2 has critical/warning content flags,
+any "Metadata Missing" flag is upgraded from info → warning so it doesn't
+get buried under benign explanations.
+
+### Results
+Before: **10/100 LOW**
+After:  **100/100 HIGH**
+
+New flags that fired on Myssy's sample:
+- `critical` Missing Decimal Formatting on Monetary Fields (+40)
+- `warning`  Multiple W-2 Forms on Single Page (+25)
+
+(Plus pre-existing flags: Missing Tax Year +40, Metadata Missing +10)
+
+### Also Fixed
+Pre-existing Python 3.9 f-string syntax error on line 726 (nested quotes in f-string).
+
+*Changes implemented by Molesley, 2026-07-03*

@@ -288,6 +288,8 @@ class DocumentAnalyzer:
                 results['math_validation'] = self._validate_pay_stub_math(text, results['extracted_data'])
             elif doc_type == "W-2":
                 results['math_validation'] = self._validate_w2_math(text, results['extracted_data'])
+                # NEW 2026-07-03: W-2 forgery formatting checks (Myssy Clayson sample)
+                self._check_w2_formatting(text, results['extracted_data'])
             elif doc_type == "1099":
                 # NEW: 1099 specific validation
                 results['math_validation'] = self._validate_1099(text, results['extracted_data'])
@@ -303,6 +305,12 @@ class DocumentAnalyzer:
         # Generate recommendations
         results['recommendations'] = self._generate_recommendations(results)
         
+        # Post-processing: if W-2 has content-level critical/warning flags, don't let
+        # "Metadata Missing" stay as Info — upgrade it to Warning so it contributes
+        # to the score honestly (2026-07-03, Myssy Clayson improvement)
+        if results.get('doc_type') == 'W-2':
+            self._upgrade_metadata_flag_if_content_flagged()
+
         # Compile results
         results['flags'] = self.flags
         results['risk_score'] = max(0, min(self.risk_score, 100))
@@ -723,7 +731,7 @@ class DocumentAnalyzer:
             unique_types = list(set(redaction_types))
             self._add_flag(
                 'Appropriate Redactions Detected',
-                f'Document contains redacted sensitive information ({', '.join(unique_types)}). '
+                f'Document contains redacted sensitive information ({"/ ".join(unique_types)}). '
                 'This is expected when candidates are asked to protect SSN, account numbers, or other PII.',
                 'info',
                 -5  # Small bonus - shows candidate followed instructions
@@ -1095,6 +1103,303 @@ class DocumentAnalyzer:
                 )
                 break
     
+    # -----------------------------------------------------------------------
+    # W-2 FORGERY FORMATTING CHECKS (added 2026-07-03, Myssy Clayson sample)
+    # -----------------------------------------------------------------------
+
+    def _check_w2_formatting(self, text: str, data: Dict):
+        """Run W-2-specific forgery formatting checks based on real fraud patterns.
+
+        Added 2026-07-03 after Myssy Clayson forwarded a forged W-2 that scored
+        only 10/100 because it passed all existing heuristics.  The forgery had:
+          - Two W-2s printed on a single page
+          - All monetary amounts written without cents (918 instead of 918.00)
+          - Implausibly low wages ($360 and $918) with SS/Medicare withholding
+          - Blank Box 15 employer state ID despite state wages/tax being present
+        """
+        self._check_w2_decimal_formatting(text, data)
+        self._check_multiple_w2_on_page(text)
+        self._check_low_wages_with_withholding(text, data)
+        self._check_missing_box15_state_id(text, data)
+
+    def _check_w2_decimal_formatting(self, text: str, data: Dict):
+        """Flag W-2 monetary fields that lack IRS-required two-digit cents (.dd).
+
+        IRS Publication 1141 requires that all dollar amounts on Copy A and
+        equivalent employee copies include cents expressed as two digits after
+        a decimal point (e.g. 918.00, not 918).  Forged W-2s created in word
+        processors or image editors almost always omit the decimal entirely.
+
+        Trigger: 3+ money fields present AND fewer than 50% contain a decimal.
+        Severity: critical  |  Score impact: +40
+        """
+        # Collect all candidate monetary amounts from the OCR text.
+        # We look for sequences of digits (with optional commas) that appear in
+        # contexts typical of W-2 box values.  We accept amounts even without a
+        # leading $ because OCR often drops the dollar sign on scanned forms.
+        #
+        # Strategy:
+        #   1. Find every occurrence of a standalone number (2-6 digits,
+        #      optionally with comma-grouping) that looks like a dollar amount.
+        #   2. Separately count how many of those have an explicit ".dd" suffix.
+        #   3. If 3+ found and <50% have decimals → flag.
+
+        # Pattern A: values that definitely have decimals
+        decimal_amounts = re.findall(
+            r'(?<![\d.])\d{1,6}(?:,\d{3})*\.\d{2}(?![\d.])',
+            text
+        )
+
+        # Pattern B: values that look like money but have NO decimal
+        # (standalone integers that are plausibly a dollar amount 1-999999)
+        no_decimal_amounts = re.findall(
+            r'(?<![\d.,])(?<!\.)(\d{2,6})(?![\d.,])',
+            text
+        )
+        # Filter to plausible wage/tax amounts (>= 1, exclude years/zip codes)
+        no_decimal_filtered = [
+            v for v in no_decimal_amounts
+            if 1 <= int(v) <= 200000 and not re.match(r'^(19|20)\d{2}$', v)
+            and not re.match(r'^\d{5}$', v)  # exclude zip codes
+        ]
+
+        total_fields = len(decimal_amounts) + len(no_decimal_filtered)
+        if total_fields >= 3:
+            decimal_pct = len(decimal_amounts) / total_fields
+            if decimal_pct < 0.50:
+                self._add_flag(
+                    'Missing Decimal Formatting on Monetary Fields',
+                    f'Only {len(decimal_amounts)} of {total_fields} detected monetary values '
+                    f'include required cent formatting (e.g. 918.00).  '
+                    f'IRS regulations require two-digit cents on all W-2 dollar amounts '
+                    f'(Publication 1141).  Omitting decimals is a common pattern in '
+                    f'forged W-2s created in word processors or image editors.',
+                    'critical',
+                    40
+                )
+
+    def _check_multiple_w2_on_page(self, text: str):
+        """Flag documents that contain two or more W-2 forms on a single page.
+
+        A single image or PDF page should contain exactly one W-2.  Multiple
+        W-2s on one page indicate either a scan of an unofficial printout or a
+        crudely assembled composite forgery.
+
+        Detection: count distinct EINs or distinct "Employer identification
+        number" headers.  Two or more triggers the flag.
+
+        Severity: warning  |  Score impact: +25
+        """
+        # Count distinct EIN values (format: ##-#######)
+        eins_found = re.findall(r'\b\d{2}-\d{7}\b', text)
+        unique_eins = set(eins_found)
+
+        # Count occurrences of the employer block header phrase
+        employer_headers = re.findall(
+            r'employer(?:\W{0,5})(?:identification|name)',
+            text,
+            re.IGNORECASE
+        )
+
+        # Also count W-2 header occurrences
+        w2_headers = re.findall(
+            r'(?:form\s*w-?2|wage\s*and\s*tax\s*statement)',
+            text,
+            re.IGNORECASE
+        )
+
+        multiple_eins    = len(unique_eins) >= 2
+        multiple_headers = len(employer_headers) >= 2 or len(w2_headers) >= 2
+
+        if multiple_eins or multiple_headers:
+            details = []
+            if multiple_eins:
+                details.append(f'{len(unique_eins)} distinct EINs ({", ".join(sorted(unique_eins))})')
+            if multiple_headers:
+                details.append(
+                    f'{len(employer_headers)} employer-name blocks and '
+                    f'{len(w2_headers)} W-2 headers'
+                )
+            self._add_flag(
+                'Multiple W-2 Forms on Single Page',
+                f'This document appears to contain more than one W-2 form: '
+                + '; '.join(details) + '.  '
+                f'Legitimate W-2s are issued as individual pages.  '
+                f'Multiple W-2s on one page indicate an unofficial print or a '
+                f'composite forgery.',
+                'warning',
+                25
+            )
+
+    def _check_low_wages_with_withholding(self, text: str, data: Dict):
+        """Flag implausibly low annual wages that still show tax withholding.
+
+        Workers earning under $2,000 annually from a single employer are
+        typically exempt from federal income tax withholding and often exempt
+        from state withholding.  Fabricators sometimes forget to zero-out
+        withholding when they reduce wages.
+
+        Trigger: Box 1 wages < $2,000 AND any withholding > $0.
+        Severity: warning  |  Score impact: +20
+        """
+        LOW_WAGE_THRESHOLD = 2000.0
+
+        # Try extracted data first; fall back to regex scan of raw OCR text
+        wages = data.get('wages')
+        if wages is None:
+            # Broader pattern: standalone amounts that appear near box 1 / wages labels
+            wage_match = re.search(
+                r'(?:box\s*1|wages[,\s]|tips)[^\n]{0,30}?(\d{1,7}(?:\.\d{2})?)',
+                text, re.IGNORECASE
+            )
+            if wage_match:
+                try:
+                    wages = float(wage_match.group(1).replace(',', ''))
+                except ValueError:
+                    wages = None
+
+        try:
+            wages = float(wages) if wages is not None else None
+        except (TypeError, ValueError):
+            wages = None
+
+        if wages is None or wages >= LOW_WAGE_THRESHOLD:
+            return
+
+        # Now check for any withholding
+        withholding_fields = [
+            data.get('federal_withheld'),
+            data.get('social_security_tax'),
+            data.get('medicare_tax'),
+            data.get('state_tax'),
+        ]
+        has_withholding = any(v is not None and float(v) > 0 for v in withholding_fields)
+
+        # Also scan raw text for withholding clues if structured data is missing
+        if not has_withholding:
+            wh_match = re.search(
+                r'(?:federal.*withheld|ss.*tax|medicare.*tax|state.*tax|'
+                r'social security tax withheld)[^\n]{0,20}?(\d+(?:\.\d{2})?)',
+                text, re.IGNORECASE
+            )
+            if wh_match:
+                try:
+                    has_withholding = float(wh_match.group(1)) > 0
+                except ValueError:
+                    pass
+
+        if has_withholding:
+            self._add_flag(
+                'Implausibly Low Wages With Tax Withholding',
+                f'Box 1 wages of ${wages:,.2f} are below $2,000 yet the form shows '
+                f'tax withholding.  Workers at this income level are generally exempt '
+                f'from federal and state income tax withholding.  This pattern is '
+                f'common in fabricated W-2s where the wage amount was reduced without '
+                f'adjusting withholding lines.',
+                'warning',
+                20
+            )
+
+    def _check_missing_box15_state_id(self, text: str, data: Dict):
+        """Flag W-2s with state wages/tax but no employer state ID (Box 15).
+
+        Box 15 (Employer's state ID number) is required whenever Box 16 (state
+        wages) or Box 17 (state income tax) are populated.  Forged forms often
+        include state amounts while leaving the state ID blank because the
+        fabricator doesn't have the employer's real state registration number.
+
+        Severity: warning  |  Score impact: +15
+        """
+        # Check whether state wage/tax data is present
+        state_wages = data.get('state_wages')
+        state_tax   = data.get('state_tax')
+
+        has_state_amounts = False
+        try:
+            if state_wages is not None and float(state_wages) > 0:
+                has_state_amounts = True
+        except (TypeError, ValueError):
+            pass
+        try:
+            if not has_state_amounts and state_tax is not None and float(state_tax) > 0:
+                has_state_amounts = True
+        except (TypeError, ValueError):
+            pass
+
+        # Also look in raw OCR text for state wage/tax indicators
+        if not has_state_amounts:
+            if re.search(
+                r'(?:box\s*1[67]|state\s*wages|state.*income\s*tax)[^\n]{0,20}?\d+',
+                text, re.IGNORECASE
+            ):
+                has_state_amounts = True
+
+        if not has_state_amounts:
+            return
+
+        # Now check whether a Box 15 state ID is populated.
+        # Look for a non-blank value after box-15 / state employer ID labels.
+        box15_match = re.search(
+            r'(?:box\s*15|state(?:\s+employer)?[\s\']*s?\s*(?:id|identification)'
+            r'(?:\s*number)?)[\s:]*([\w-]{3,})',
+            text, re.IGNORECASE
+        )
+        if box15_match:
+            # Found something — not blank, no need to flag
+            return
+
+        # Also accept a bare state-ID pattern: two letters then 8+ digits/dashes
+        if re.search(r'\b[A-Z]{2}[-\s]?\d{6,}\b', text):
+            return
+
+        self._add_flag(
+            'Missing Employer State ID (Box 15)',
+            'State wages or state income tax are present on this W-2 but Box 15 '
+            '(Employer\'s state ID number) appears to be blank.  All states that '
+            'require income tax reporting also require the employer\'s state '
+            'registration number.  A blank Box 15 alongside state amounts is a '
+            'strong indicator that this W-2 was fabricated.',
+            'warning',
+            15
+        )
+
+    def _upgrade_metadata_flag_if_content_flagged(self):
+        """After all checks: if a W-2 has content-level critical/warning flags,
+        upgrade any 'Metadata Missing' flag from info to warning so it keeps its
+        score contribution and isn't silently discounted.
+
+        Added 2026-07-03 to prevent metadata-missing from being buried under
+        benign explanations when content flags are clearly suspicious.
+        """
+        # Check whether any non-metadata flag is critical or warning
+        content_severities = {
+            f['severity']
+            for f in self.flags
+            if 'Metadata' not in f.get('title', '') and 'metadata' not in f.get('title', '').lower()
+        }
+        has_content_concerns = bool(
+            content_severities & {'critical', 'warning'}
+        )
+
+        if not has_content_concerns:
+            return
+
+        for flag in self.flags:
+            if (
+                'metadata' in flag.get('title', '').lower()
+                and flag.get('severity') == 'info'
+            ):
+                # Upgrade to warning and record a note in the description
+                flag['severity'] = 'warning'
+                flag['description'] += (
+                    '  [Severity upgraded from info to warning because '
+                    'content-level fraud indicators were also detected.]'
+                )
+                # The score was already added when _add_flag was called;
+                # no re-add needed — just the label change matters for UI priority.
+
+    # -----------------------------------------------------------------------
+
     def _extract_document_data(self, text: str, doc_type: str) -> Dict:
         """Extract structured data from document text."""
         data = {}
