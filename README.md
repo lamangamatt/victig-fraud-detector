@@ -15,6 +15,7 @@ A web-based tool for detecting potential fraud in employment verification docume
 - Pay Stubs
 - W-2 Forms
 - 1099 Forms
+- **IRS Wage & Income Transcripts** (batch mode — cross-checks tracking numbers across pages to catch copy-pasted transcript headers; added 2026-07-07 based on a Myssy Clayson forgery sample)
 - Offer Letters
 - Diplomas/Transcripts
 

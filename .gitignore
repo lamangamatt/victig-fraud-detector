@@ -4,4 +4,6 @@ __pycache__/
 .DS_Store
 .streamlit/secrets.toml
 test-samples/
+# Real applicant samples — contain PII, never commit
+samples/
 

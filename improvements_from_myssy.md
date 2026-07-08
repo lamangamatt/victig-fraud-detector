@@ -321,3 +321,62 @@ New flags that fired on Myssy's sample:
 Pre-existing Python 3.9 f-string syntax error on line 726 (nested quotes in f-string).
 
 *Changes implemented by Molesley, 2026-07-03*
+
+---
+
+## 2026-07-07 Changes — IRS Wage & Income Transcript Batch Detection
+
+### Background
+Myssy forwarded two W-2 PDFs (`KCC_W2_Redacted.pdf`, `Excalibur_W2_Redacted.pdf`)
+that each present themselves as page 1 of an IRS Wage & Income Transcript.
+Both share tracking number **110822371779**, request date 07-07-2026,
+response date 07-07-2026, TIN XXX-XX-5229, and tax period 12-31-2024. But
+they were created 5 hours apart and have different page dimensions — a
+genuine IRS transcript packet is a single continuous PDF, so this is
+impossible. The existing single-document detector rated both LOW/25 and
+missed the actual fraud entirely.
+
+### New Module: `irs_transcript.py`
+
+Rather than pile more onto `document_analyzer.py`, this fraud pattern got
+its own standalone module because:
+
+1. It requires **cross-document comparison** (a paradigm the existing
+   detector doesn't support).
+2. It has a **document-type-specific rule set** (IRS transcript structure).
+3. It benefits from being independently unit-testable.
+
+### New Doc Type: "IRS Transcript"
+
+Added to the Streamlit UI's document-type dropdown. When selected, the
+uploader switches to multi-file mode and routes to the batch analyzer.
+
+### New Detection Rules
+
+Single-document rules (`analyze_single_transcript`):
+- **Missing IRS Transcript Title** (warning, +15)
+- **Missing IRS Sensitive-Data Banner** (warning, +15)
+- **Missing Transcript Tracking Number** (warning, +15)
+- **Future Request/Response Date** (critical, +40 each)
+- **Wage Amounts Blacked Out** (warning, +25) — solid black bar over
+  values column, detected via pixel-run analysis
+- **Truncated / Garbled Employer Name** (warning, +20) — e.g. "KURT CARS
+  CONS LL" (dropped LLC), "EXCA SECU IN" (dropped INC)
+
+Batch rules (`analyze_batch`):
+- **Duplicate IRS Transcript Tracking Number** (critical, +60) — two
+  documents each claim page-1 status but share tracking number
+- **Same Tracking Number, Different Creation Times** (critical, +50) —
+  PDF creation timestamps differ despite shared tracking number
+- **Same Tracking Number, Different Page Dimensions** (warning, +25)
+
+### Results
+
+Before: both files rated LOW / 25/100, tool cleared the applicant.
+After:  overall batch verdict **HIGH / 100/100**, each individual doc
+        HIGH / 100/100, with all three batch flags firing on the
+        smoking-gun duplicate tracking number.
+
+Regression test: `test_myssy_2026_07_07.py`
+
+*Changes implemented by Molesley, 2026-07-07*

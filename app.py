@@ -8,6 +8,7 @@ import os
 import io
 from datetime import datetime
 from document_analyzer import DocumentAnalyzer
+from irs_transcript import analyze_files as analyze_irs_transcripts
 from fpdf import FPDF
 
 st.set_page_config(
@@ -111,6 +112,7 @@ with st.sidebar:
     - ✅ Pay Stubs
     - ✅ W-2 Forms
     - ✅ 1099 Forms
+    - ✅ IRS Wage & Income Transcripts (batch)
     - ✅ Offer Letters
     - ✅ Diplomas/Transcripts
     
@@ -264,25 +266,170 @@ if page == "📖 About & Methodology":
     st.stop()
 
 # Main content - Analyze Document page
-uploaded_file = st.file_uploader(
-    "📤 Upload Document for Analysis",
-    type=['pdf', 'png', 'jpg', 'jpeg'],
-    help="Upload a pay stub, W-2, or other employment document"
-)
-
+#
+# Doc-type first so we can switch the uploader into multi-file mode
+# for IRS Wage & Income Transcripts (batch cross-document checks).
 col1, col2 = st.columns(2)
 with col1:
     doc_type = st.selectbox(
         "Document Type",
-        ["Pay Stub", "W-2", "1099", "Offer Letter", "Diploma/Transcript", "Other"],
-        help="Select the type of document for specialized analysis"
+        [
+            "Pay Stub",
+            "W-2",
+            "1099",
+            "IRS Transcript",
+            "Offer Letter",
+            "Diploma/Transcript",
+            "Other",
+        ],
+        help=(
+            "Select the type of document for specialized analysis. "
+            "'IRS Transcript' supports batch upload so we can catch "
+            "duplicate tracking numbers across pages."
+        ),
     )
 with col2:
     candidate_ref = st.text_input(
         "Candidate Reference (Optional)",
         placeholder="e.g., Applicant ID or Name",
-        help="For tracking purposes"
+        help="For tracking purposes",
     )
+
+is_irs_transcript = (doc_type == "IRS Transcript")
+
+if is_irs_transcript:
+    st.info(
+        "📑 **IRS Wage & Income Transcript mode.** Upload every page/W-2 "
+        "the applicant sent. The detector will cross-check tracking "
+        "numbers, request/response dates, and page metadata to catch "
+        "copy-pasted transcript headers \u2014 the pattern Myssy caught "
+        "on 2026-07-07 (same tracking number on two 'page 1's)."
+    )
+    uploaded_files = st.file_uploader(
+        "📤 Upload IRS Transcript page(s) for Analysis",
+        type=['pdf', 'png', 'jpg', 'jpeg'],
+        accept_multiple_files=True,
+        help="Upload one or more IRS transcript pages / W-2s from the same applicant",
+    )
+    uploaded_file = None
+else:
+    uploaded_file = st.file_uploader(
+        "📤 Upload Document for Analysis",
+        type=['pdf', 'png', 'jpg', 'jpeg'],
+        help="Upload a pay stub, W-2, or other employment document",
+    )
+    uploaded_files = None
+
+# ---------------------------------------------------------------------------
+# IRS Wage & Income Transcript batch analysis
+# ---------------------------------------------------------------------------
+if is_irs_transcript and uploaded_files:
+    st.divider()
+    st.subheader("📑 IRS Transcript Batch Analysis")
+
+    tmp_paths = []
+    for uf in uploaded_files:
+        p = f"/tmp/{uf.name}"
+        with open(p, "wb") as fh:
+            fh.write(uf.getbuffer())
+        tmp_paths.append(p)
+
+    with st.spinner(f"Analyzing {len(tmp_paths)} document(s)…"):
+        report = analyze_irs_transcripts(tmp_paths)
+
+    # ---- Overall verdict ---------------------------------------------------
+    level = report["risk_level"]
+    score = report["risk_score"]
+    if level == "HIGH":
+        st.markdown("<div class='risk-high'>🔴 HIGH RISK</div>", unsafe_allow_html=True)
+    elif level == "MEDIUM":
+        st.markdown("<div class='risk-medium'>🟡 MEDIUM RISK</div>", unsafe_allow_html=True)
+    else:
+        st.markdown("<div class='risk-low'>🟢 LOW RISK</div>", unsafe_allow_html=True)
+    st.metric("Batch risk score", f"{score}/100")
+    st.caption(
+        f"Analyzed {report['file_count']} document(s) at {report['analyzed_at']}"
+    )
+
+    # ---- Batch-level flags -------------------------------------------------
+    if report["batch_flags"]:
+        st.markdown("### 🚩 Cross-Document Flags")
+        for f in report["batch_flags"]:
+            sev = f["severity"]
+            cls = (
+                "flag-critical" if sev == "critical"
+                else "flag-warning" if sev == "warning"
+                else "flag-info"
+            )
+            icon = "🔴" if sev == "critical" else "🟡" if sev == "warning" else "🔵"
+            st.markdown(
+                f"<div class='flag-item {cls}'>"
+                f"<strong>{icon} {f['title']}</strong> "
+                f"<span style='float:right'>+{f['score_impact']}</span><br>"
+                f"{f['description']}"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+    else:
+        st.success("No cross-document red flags.")
+
+    # ---- Per-document detail ----------------------------------------------
+    st.markdown("### 📄 Per-Document Detail")
+    for doc in report["documents"]:
+        name = os.path.basename(doc["file"])
+        with st.expander(f"{name} — {doc['risk_level']} ({doc['score']}/100)",
+                         expanded=(doc["risk_level"] != "LOW")):
+            fields = doc["fields"]
+            fcol1, fcol2 = st.columns(2)
+            with fcol1:
+                st.markdown("**Extracted Transcript Fields**")
+                st.write({
+                    "Tracking Number": fields.get("tracking_number"),
+                    "Request Date": fields.get("request_date"),
+                    "Response Date": fields.get("response_date"),
+                    "TIN Provided": fields.get("tin_provided"),
+                    "Tax Period": fields.get("tax_period"),
+                    "Employer": fields.get("employer_name"),
+                })
+            with fcol2:
+                st.markdown("**Document Fingerprint**")
+                st.write({
+                    "Has IRS masthead": fields.get("has_masthead"),
+                    "Has transcript title": fields.get("has_title"),
+                    "W-2 sections on page": fields.get("w2_section_count"),
+                    "Page size (pts)": fields.get("page_size_pts"),
+                    "PDF creation date": fields.get("pdf_creation_date"),
+                    "Wage-value blackout bar": fields.get("wage_bar_redaction"),
+                })
+
+            if doc["flags"]:
+                for f in doc["flags"]:
+                    sev = f["severity"]
+                    cls = (
+                        "flag-critical" if sev == "critical"
+                        else "flag-warning" if sev == "warning"
+                        else "flag-info"
+                    )
+                    icon = "🔴" if sev == "critical" else "🟡" if sev == "warning" else "🔵"
+                    st.markdown(
+                        f"<div class='flag-item {cls}'>"
+                        f"<strong>{icon} {f['title']}</strong> "
+                        f"<span style='float:right'>+{f['score_impact']}</span><br>"
+                        f"{f['description']}"
+                        f"</div>",
+                        unsafe_allow_html=True,
+                    )
+            else:
+                st.info("No flags on this document.")
+
+    # Cleanup temp files
+    for p in tmp_paths:
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+
+    st.stop()
 
 if uploaded_file:
     st.divider()
