@@ -236,35 +236,41 @@ def detect_wage_redaction_bar(pdf_path: str, dpi: int = 200) -> bool:
         if len(starts):
             row_max[r] = int((ends - starts).max())
 
-    # Two independent signals of a wage-value blackout bar:
+    # A wage-value blackout bar is a *tall* contiguous vertical band —
+    # even a narrow one, because it only needs to cover the right-hand
+    # dollar-values column. Genuine IRS transcripts include thin
+    # horizontal separator rules around the "Sensitive Taxpayer Data"
+    # masthead that span the full page width but are only 1-3 pixels
+    # tall; we must not flag those.
     #
-    #   (1) A contiguous vertical band (≥20 px tall) where every row has
-    #       a dark run wider than ~20% of the full page width. That's the
-    #       characteristic "big black rectangle over the values column"
-    #       shape Myssy's forgeries use.
+    # Signal: a contiguous run of rows where every row has a dark run
+    # at least as wide as a short dollar amount (>=50 px at 200 dpi ~ 3+
+    # characters), and the band is at least ~30 rows tall (multiple
+    # text lines high).
     #
-    #   (2) A single row with an extremely wide dark run (≥40% of the
-    #       page width). Even one line-height of that means an applicant
-    #       drew a full-column blackout.
-    #
-    # Either signal is enough to flag.
+    # Empirically on the KCC/Excalibur forgeries this yields bands of
+    # 350-560 rows; on clean multi-page IRS transcripts (including
+    # Myssy's Maryville sample) the tallest such band is <=2 rows.
 
-    wide = max(120, int(w * 0.20))
-    very_wide = max(200, int(w * 0.40))
-    heavy_rows = row_max >= wide
-
-    if heavy_rows.any():
-        d = np.diff(np.concatenate(([0], heavy_rows.astype(np.int8), [0])))
+    def _longest_contiguous_run(mask: np.ndarray) -> int:
+        if not mask.any():
+            return 0
+        d = np.diff(np.concatenate(([0], mask.astype(np.int8), [0])))
         starts = np.where(d == 1)[0]
         ends = np.where(d == -1)[0]
-        longest_band = int((ends - starts).max()) if len(starts) else 0
-        if longest_band >= 20:
-            return True
+        if not len(starts):
+            return 0
+        return int((ends - starts).max())
 
-    if (row_max >= very_wide).sum() >= 5:
-        return True
+    # Pixel thresholds scale with render DPI so the detector behaves
+    # the same regardless of the caller-supplied dpi. At 200 dpi:
+    #   min_dark_run_px = 50   (~3-4 characters wide at 10pt)
+    #   min_band_rows   = 30   (~2 text lines tall)
+    min_dark_run_px = max(20, int(round(50 * dpi / 200)))
+    min_band_rows   = max(15, int(round(30 * dpi / 200)))
 
-    return False
+    band_height = _longest_contiguous_run(row_max >= min_dark_run_px)
+    return band_height >= min_band_rows
 
 
 # ---------------------------------------------------------------------------
