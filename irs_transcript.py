@@ -79,6 +79,36 @@ _RE_EMPLOYER_HDR   = re.compile(
     re.I | re.S,
 )
 
+# --- Myssy 2026-07-13 forgery signals -------------------------------------
+# "Submission Type: Origin" instead of "Original" (fabricator dropped
+# trailing "al" when redacting/converting the PDF).
+_RE_SUBMISSION_TRUNCATED = re.compile(
+    r"^[ \t]*Submission\s*Type[:\s]*(Origin|Origi|Orig)\s*$",
+    re.I | re.M,
+)
+_RE_SUBMISSION_OK = re.compile(
+    r"^[ \t]*Submission\s*Type[:\s]*Original\s*$",
+    re.I | re.M,
+)
+
+# "Third Party Sick Pay Indicator: Un" instead of "Unanswered" (same
+# truncation tell). Match on its own line to avoid catching valid
+# "Unanswered" occurrences.
+_RE_SICKPAY_TRUNCATED = re.compile(
+    r"^[ \t]*Third\s*Party\s*Sick\s*Pay\s*Indicator[:\s]*(Un|Una|Unans|Unansw|Unanswe|Unanswer|Unanswere)\s*$",
+    re.I | re.M,
+)
+
+# Replacement footer box: "NON-EMPLOYMENT INFORMATION REDACTED".
+# Genuine IRS transcripts end with an IRS footer/URL, not this box.
+_RE_NONEMP_REDACT_BOX = re.compile(
+    r"NON[- ]?EMPLOYMENT\s+INFORMATION\s+REDACTED",
+    re.I,
+)
+
+# Page-1 header block: Request Date populated but Response Date not.
+# Detected via field-level checks, not this regex alone.
+
 
 @dataclass
 class TranscriptFields:
@@ -99,6 +129,14 @@ class TranscriptFields:
     pdf_mod_date: Optional[str] = None
     page_width_pts: Optional[float] = None
     page_height_pts: Optional[float] = None
+
+    # --- Myssy 2026-07-13 forgery signals -----------------------------
+    truncated_submission_types: int = 0    # "Submission Type: Origin" hits
+    ok_submission_types: int = 0           # "Submission Type: Original" hits
+    truncated_sickpay_indicators: int = 0  # "Sick Pay Indicator: Un" hits
+    has_nonemp_redacted_box: bool = False  # replacement footer box present
+    pdf_editor: Optional[str] = None       # /Producer or /Creator metadata
+    pdf_subject: Optional[str] = None      # /Subject metadata
 
     @property
     def looks_like_page_one(self) -> bool:
@@ -131,6 +169,12 @@ def parse_transcript_text(text: str, source_file: str = "") -> TranscriptFields:
     f.tax_period = _first(_RE_TAX_PERIOD, text)
     f.w2_section_count = len(_RE_W2_SECTION.findall(text))
     f.employer_name = _first(_RE_EMPLOYER_HDR, text)
+
+    # Myssy 2026-07-13 signals
+    f.truncated_submission_types = len(_RE_SUBMISSION_TRUNCATED.findall(text))
+    f.ok_submission_types = len(_RE_SUBMISSION_OK.findall(text))
+    f.truncated_sickpay_indicators = len(_RE_SICKPAY_TRUNCATED.findall(text))
+    f.has_nonemp_redacted_box = bool(_RE_NONEMP_REDACT_BOX.search(text))
 
     return f
 
@@ -165,6 +209,11 @@ def extract_from_pdf(pdf_path: str, dpi: int = 300) -> TranscriptFields:
         meta = doc.metadata or {}
         fields.pdf_creation_date = meta.get("creationDate")
         fields.pdf_mod_date = meta.get("modDate")
+        # Producer/Creator = the tool that wrote the PDF. Legitimate IRS
+        # transcripts are produced by IRS internal tooling; forgeries
+        # usually show a consumer PDF editor here.
+        fields.pdf_editor = meta.get("producer") or meta.get("creator")
+        fields.pdf_subject = meta.get("subject")
         return fields
     finally:
         doc.close()
@@ -451,6 +500,101 @@ def analyze_single_transcript(fields: TranscriptFields,
             score_impact=20,
         ))
 
+    # ---- Myssy 2026-07-13 (Christopher Nicola) signals ----
+
+    # "Submission Type: Origin" is a fabrication tell — the trailing
+    # "al" was clipped when the PDF was converted to an editable format.
+    # We only flag if we saw multiple truncated occurrences, because a
+    # single stray "Origin" could just be an OCR artefact.
+    if fields.truncated_submission_types >= 2:
+        flags.append(TranscriptFlag(
+            title='Truncated "Submission Type" Values',
+            description=(
+                f'Found {fields.truncated_submission_types} W-2 sections showing '
+                '"Submission Type: Origin" instead of the correct "Original". '
+                "Real IRS transcripts consistently show the full word "
+                '"Original" right-justified. Truncated values typically appear '
+                "when someone converts the IRS's uneditable PDF into an "
+                "editable format and clips text while modifying the document."
+            ),
+            severity="critical",
+            score_impact=35,
+        ))
+
+    # "Third Party Sick Pay Indicator: Un" — same fabrication tell.
+    # Value should be a full word ("Unanswered", "Yes", "No").
+    if fields.truncated_sickpay_indicators >= 2:
+        flags.append(TranscriptFlag(
+            title='Truncated "Sick Pay Indicator" Values',
+            description=(
+                f'Found {fields.truncated_sickpay_indicators} W-2 sections showing '
+                'a truncated Third Party Sick Pay Indicator value (e.g. "Un" '
+                'instead of "Unanswered"). Same PDF-conversion clipping pattern '
+                'as truncated submission types.'
+            ),
+            severity="warning",
+            score_impact=25,
+        ))
+
+    # Replacement footer box — real IRS transcripts end with an IRS URL/
+    # signature footer, never a "NON-EMPLOYMENT INFORMATION REDACTED" box.
+    if fields.has_nonemp_redacted_box:
+        flags.append(TranscriptFlag(
+            title='"Non-Employment Information Redacted" Replacement Box',
+            description=(
+                'Document contains a "NON-EMPLOYMENT INFORMATION REDACTED" box '
+                'where the IRS footer should be. Genuine IRS Wage & Income '
+                'Transcripts end with an IRS-generated footer, not a '
+                'redaction-notice box added by the applicant. This is a '
+                'strong indication the file was converted to an editable '
+                'format and modified.'
+            ),
+            severity="critical",
+            score_impact=40,
+        ))
+
+    # Missing Response Date when Request Date and other page-1 headers
+    # are present. IRS transcript packets always include both dates on
+    # page 1 — blanking the response date is a common fabrication tell.
+    if fields.has_title and fields.has_masthead and fields.request_date \
+            and not fields.response_date:
+        flags.append(TranscriptFlag(
+            title="Missing Response Date on IRS Transcript",
+            description=(
+                f'Request Date is populated ({fields.request_date}) but '
+                'Response Date is blank. Genuine IRS Wage & Income Transcripts '
+                'always include both dates on page 1 — blanking the response '
+                'date is a common fabrication tell.'
+            ),
+            severity="warning",
+            score_impact=25,
+        ))
+
+    # PDF metadata inconsistent with IRS output. Real IRS transcripts are
+    # not stamped with a consumer PDF editor's producer string, nor with
+    # a hand-typed subject like "Employment verification". We flag this
+    # as informational unless we already have other signals.
+    if fields.pdf_subject and fields.has_title:
+        subj = fields.pdf_subject.strip().lower()
+        # IRS transcripts have no /Subject or a system-generated one.
+        # "Employment verification" (as on the Christopher Nicola sample)
+        # is a give-away that a human re-saved this file.
+        suspicious_subjects = ("employment verification", "redacted",
+                               "verification", "transcript redacted")
+        if any(s in subj for s in suspicious_subjects):
+            flags.append(TranscriptFlag(
+                title="PDF Metadata Rewritten by an Editor",
+                description=(
+                    f'PDF Subject metadata reads "{fields.pdf_subject}". '
+                    'IRS-issued transcripts do not carry human-authored '
+                    'subject strings like this. The file was almost certainly '
+                    'opened in a PDF editor and re-saved — the IRS only '
+                    'releases transcripts as uneditable PDFs.'
+                ),
+                severity="warning",
+                score_impact=15,
+            ))
+
     # Very tight sanity check on any obviously-partial address is deferred
     # to the batch analyzer where we have more context.
 
@@ -613,7 +757,14 @@ def analyze_files(file_paths: List[str]) -> Dict[str, Any]:
                 "w2_section_count": f.w2_section_count,
                 "page_size_pts": (f.page_width_pts, f.page_height_pts),
                 "pdf_creation_date": f.pdf_creation_date,
+                "pdf_mod_date": f.pdf_mod_date,
+                "pdf_editor": f.pdf_editor,
+                "pdf_subject": f.pdf_subject,
                 "wage_bar_redaction": wb,
+                "truncated_submission_types": f.truncated_submission_types,
+                "ok_submission_types": f.ok_submission_types,
+                "truncated_sickpay_indicators": f.truncated_sickpay_indicators,
+                "has_nonemp_redacted_box": f.has_nonemp_redacted_box,
             },
             "flags": [fl.as_dict() for fl in flags],
             "score": score,

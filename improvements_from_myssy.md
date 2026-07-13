@@ -380,3 +380,94 @@ After:  overall batch verdict **HIGH / 100/100**, each individual doc
 Regression test: `test_myssy_2026_07_07.py`
 
 *Changes implemented by Molesley, 2026-07-07*
+
+---
+
+## 2026-07-13 Changes — Christopher Nicola IRS Transcript Signals
+
+### Background
+Myssy forwarded another IRS Wage & Income Transcript forgery (file
+#2684776, Christopher Nicola). The applicant submitted 2018-2025
+transcripts that had been converted from the IRS's uneditable PDF into
+an editable format and modified before redaction. Myssy's five red
+flags from her 2026-07-13 email:
+
+1. **Response Date blank** in the transcript header block; TIN/Tax
+   Period labels moved to the wrong side; request date in smaller red
+   font.
+2. **Employee first names removed** (and partial last name on one W-2
+   — "NI" for "NICOLA").
+3. **Submission Type shows "Origin"** instead of "Original"; not
+   right-justified. Third Party Sick Pay Indicator values also
+   truncated (e.g. "Un" instead of "Unanswered").
+4. **IRS footer replaced** with a "NON-EMPLOYMENT INFORMATION
+   REDACTED" box.
+5. **Employer names not consistently truncated** into 3-4 word groups
+   (the format used by real IRS transcript output).
+
+Core insight (Myssy): the IRS only releases transcripts as uneditable
+PDFs. If a transcript has been re-flowed into an editable format, we
+cannot trust any content in it.
+
+### Baseline
+Before these changes, the existing detector rated this file **LOW /
+40**, catching only "Missing Transcript Tracking Number" and "Wage
+Amounts Blacked Out".
+
+### New Detection Rules (in `analyze_single_transcript`)
+
+- **`Truncated "Submission Type" Values`** (critical, +35) — fires
+  when 2+ W-2 sections show "Submission Type: Origin" (or "Origi") on
+  their own line instead of "Original".
+- **`Truncated "Sick Pay Indicator" Values`** (warning, +25) — fires
+  when 2+ W-2 sections show a truncated Sick Pay Indicator value like
+  "Un" instead of "Unanswered".
+- **`"Non-Employment Information Redacted" Replacement Box`** (critical,
+  +40) — fires when the phrase "NON-EMPLOYMENT INFORMATION REDACTED"
+  appears anywhere in the document. Real IRS transcripts end with an
+  IRS footer, never this box.
+- **`Missing Response Date on IRS Transcript`** (warning, +25) —
+  fires when the document has the IRS masthead + title + Request Date
+  populated, but Response Date is blank.
+- **`PDF Metadata Rewritten by an Editor`** (warning, +15) — fires
+  when `/Subject` metadata is a human-authored string like "Employment
+  verification". The IRS's uneditable PDF doesn't carry these.
+
+### New Fields Exposed
+`TranscriptFields` now carries:
+- `truncated_submission_types` (int)
+- `ok_submission_types` (int)
+- `truncated_sickpay_indicators` (int)
+- `has_nonemp_redacted_box` (bool)
+- `pdf_editor` (Producer/Creator string)
+- `pdf_subject` (Subject metadata)
+
+### Results
+- Before: **LOW / 40**, 2 flags → applicant might have been cleared.
+- After: **HIGH / 100/100**, 7 flags:
+  - Missing Transcript Tracking Number
+  - Wage Amounts Blacked Out
+  - Truncated "Submission Type" Values (critical)
+  - Truncated "Sick Pay Indicator" Values
+  - "Non-Employment Information Redacted" Replacement Box (critical)
+  - Missing Response Date on IRS Transcript
+  - PDF Metadata Rewritten by an Editor
+
+### Known Deferred Item — Employer Name Heuristic
+Myssy's signal #5 ("employer names not consistently truncated into
+3-4 word groups") is actually the *inverse* of what our pre-existing
+`_looks_truncated` heuristic assumes. The IRS itself truncates
+employer names into short word groups (e.g. "EIGR IN", "MARY ACAD"
+on the Maryville clean sample). Fabrications that use full/untruncated
+names are the ones we should flag.
+
+Reworking that heuristic would risk regressing the KCC/Excalibur
+July-7 test (which currently benefits from a coincidental match).
+Deferred for a future pass — the Christopher Nicola forgery is already
+firing 7 other flags without needing employer-name analysis.
+
+### Regression Test
+`test_myssy_2026_07_13.py` — asserts overall HIGH risk, score ≥90, and
+that the three critical/near-critical new flags fire.
+
+*Changes implemented by Molesley, 2026-07-13*
