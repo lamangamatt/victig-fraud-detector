@@ -70,11 +70,26 @@ _RE_TRACKING       = re.compile(r"Tracking\s*Number[:\s]*([0-9]{8,20})", re.I)
 _RE_TIN            = re.compile(r"TIN\s*Provided[:\s]*([X0-9\-]{6,15})", re.I)
 _RE_TAX_PERIOD     = re.compile(r"Tax\s*Period(?:\s*Requested)?[:\s]*([0-9]{2}[-/][0-9]{2}[-/][0-9]{4})", re.I)
 _RE_W2_SECTION     = re.compile(r"Form\s+W-?2\s+Wage\s+and\s+Tax\s+Statement", re.I)
-# Employer name appears a few lines after "Employer:" — typically right
-# after the EIN line. We anchor on "EIN" and take the next non-blank line
-# that looks like an all-caps entity name.
+
+# Employer name appears after "Employer Identification Number (EIN):",
+# optionally after an EIN value row (XX-XXXNNNN). We use a two-pass
+# approach in _extract_all_employer_names(): the regex here matches
+# the header, and we skip EIN-value lines in Python to reliably get
+# the entity name across both OCR layouts (label-then-value and
+# label-value-interleaved).
+_RE_EMPLOYER_ANCHOR = re.compile(
+    r"Employer\s+Identification\s+Number\s*\(EIN\)[:\s]*",
+    re.I,
+)
+_RE_EIN_VALUE = re.compile(r"^(?:XX-XXX[0-9]+|[0-9]{2}-[0-9]{7})$")
+_RE_ADDRESS_START = re.compile(r"^\d")  # "9700 B", "6285 B", etc.
+_RE_ENTITY_NAME_CANDIDATE = re.compile(r"^[A-Z][A-Z0-9 .,&'\-]{1,}$")
+
+# Legacy single-name regex kept for parse_transcript_text backwards
+# compatibility (used by callers that only want the first employer name).
 _RE_EMPLOYER_HDR   = re.compile(
     r"Employer\s+Identification\s+Number.*?\n+\s*"
+    r"(?:XX-XXX[0-9]+|[0-9]{2}-[0-9]{7})?\s*\n?\s*"
     r"([A-Z][A-Z0-9 .,&'\-]{2,}?)\s*\n",
     re.I | re.S,
 )
@@ -124,6 +139,7 @@ class TranscriptFields:
     tax_period: Optional[str] = None
     w2_section_count: int = 0
     employer_name: Optional[str] = None
+    employer_names_all: List[str] = field(default_factory=list)  # every unique employer name
     raw_text: str = ""
     pdf_creation_date: Optional[str] = None
     pdf_mod_date: Optional[str] = None
@@ -169,6 +185,7 @@ def parse_transcript_text(text: str, source_file: str = "") -> TranscriptFields:
     f.tax_period = _first(_RE_TAX_PERIOD, text)
     f.w2_section_count = len(_RE_W2_SECTION.findall(text))
     f.employer_name = _first(_RE_EMPLOYER_HDR, text)
+    f.employer_names_all = _extract_all_employer_names(text)
 
     # Myssy 2026-07-13 signals
     f.truncated_submission_types = len(_RE_SUBMISSION_TRUNCATED.findall(text))
@@ -333,46 +350,121 @@ _GARBLE_LEGIT_TAILS = (
 )
 
 
-def _looks_truncated(name: str) -> bool:
-    """Heuristic: employer name appears truncated / garbled.
+def _extract_all_employer_names(text: str) -> List[str]:
+    """Extract every unique employer entity name from an IRS transcript.
 
-    Real IRS transcripts show the full legal entity name. Fabricators
-    who screenshot part of a page often clip the last few characters
-    ("KURT CARS CONS LL" for "…CONS LLC", "EXCA SECU IN" for
-    "EXCALIBUR SECURITY INC", etc.).
+    IRS Wage & Income Transcripts print each W-2 with a section:
+
+        Employer:
+         Employer Identification Number (EIN):
+         XX-XXX1234
+         ACME CORP
+         123 Main St
+
+    OCR ordering varies (sometimes value-then-label, sometimes
+    label-then-value). We scan line-by-line: whenever we see the
+    "Employer Identification Number" label, we consume the next
+    non-address, non-EIN-value line as the entity name.
+
+    Returns a list of unique names in first-seen order.
+    """
+    if not text:
+        return []
+
+    lines = [ln.strip() for ln in text.splitlines()]
+    names: List[str] = []
+    seen: set = set()
+    i = 0
+    while i < len(lines):
+        if _RE_EMPLOYER_ANCHOR.search(lines[i] or ""):
+            j = i + 1
+            steps = 0
+            while j < len(lines) and steps < 6:
+                candidate = lines[j].strip()
+                if not candidate:
+                    j += 1; steps += 1
+                    continue
+                if _RE_EIN_VALUE.match(candidate):
+                    j += 1; steps += 1
+                    continue
+                if _RE_ADDRESS_START.match(candidate):
+                    j += 1; steps += 1
+                    continue
+                if candidate.lower().startswith("employee"):
+                    break
+                if _RE_ENTITY_NAME_CANDIDATE.match(candidate):
+                    if candidate not in seen:
+                        seen.add(candidate)
+                        names.append(candidate)
+                    break
+                j += 1; steps += 1
+            i = j + 1
+        else:
+            i += 1
+    return names
+
+
+def _has_full_corp_suffix(name: str) -> bool:
+    """True if the name ends with a fully-spelled corporate suffix.
+
+    Real IRS transcripts truncate everything into 3-4 char word groups,
+    so a fully-spelled "LLC"/"INC"/"CORPORATION" ending would be
+    anomalous inside a genuine transcript.
+    """
+    up = name.strip().upper()
+    for suffix in _GARBLE_LEGIT_TAILS:
+        if up.endswith(" " + suffix):
+            return True
+    return False
+
+
+def _name_looks_short_truncated(name: str) -> bool:
+    """True if the name's last word looks like an IRS-style truncation stub
+    (1-2 chars) that isn't a fully-spelled corporate suffix like LLC."""
+    up = name.strip().upper()
+    tokens = up.split()
+    if len(tokens) < 2:
+        return False
+    last = tokens[-1]
+    # Fully spelled suffix → not a truncation stub
+    if _has_full_corp_suffix(name):
+        return False
+    # A 1-2 char final word that isn't a well-known short suffix (LP, PC)
+    if 1 <= len(last) <= 2 and last not in ("LP", "PC", "CO"):
+        return True
+    return False
+
+
+def _has_single_char_stub(name: str) -> bool:
+    """True if the last word is a single character (extreme truncation).
+
+    IRS truncation typically leaves 2-4 char stubs ("IN" for INC, "LL"
+    for LLC). A trailing single character like "C" (as in "BYER ENGI C")
+    is unusually aggressive and shows up on fabrications where the
+    editor clipped mid-character.
+    """
+    tokens = name.strip().split()
+    return len(tokens) >= 2 and len(tokens[-1]) == 1
+
+
+def _looks_truncated(name: str) -> bool:
+    """DEPRECATED. Kept for backwards compatibility with older callers.
+
+    Real IRS transcripts truncate employer names into 3-4 char word
+    groups ("MARY ACAD", "EIGR IN", "INNO GENO LLC"), so "truncation"
+    alone is not a reliable single-name signal. The productive
+    detection now lives in `analyze_single_transcript()` via the
+    per-document employer-name pattern analysis, which looks at all
+    employer names in the document together.
+
+    This function now returns True only for the specific pattern we've
+    seen on fabrications but never on the clean IRS sample: a trailing
+    single-character word (e.g. "BYER ENGI C") — more aggressive
+    clipping than IRS uses.
     """
     if not name:
         return False
-    up = name.strip().upper()
-
-    # Ends with a lone "L" or "LL" (dropped "LLC")
-    if re.search(r"\bL{1,2}\.?$", up):
-        # …but "LL Bean" is fine — only flag when preceded by CONS/CORP/etc.
-        if re.search(r"(CONS|COR|IN|LL)\s+L{1,2}\.?$", up):
-            return True
-        if up.endswith(" LL") or up.endswith(" L"):
-            return True
-
-    # Ends with " IN" (dropped INC)
-    if re.search(r"\bIN\.?$", up) and not up.endswith(" INC"):
-        return True
-
-    # Ends with " COR" or " COMP" (dropped)
-    if re.search(r"\b(COR|COMP|COR P|CORPORAT|COMPAN)\.?$", up):
-        return True
-
-    # Any word looks like a truncation stub (all-caps token 2-4 chars that
-    # isn't a common initialism)
-    tokens = up.split()
-    if len(tokens) >= 2:
-        last = tokens[-1]
-        if 1 <= len(last) <= 3 and last not in ("LLC", "INC", "LP", "LLP", "PC", "CO", "US", "USA"):
-            # Only flag if the rest of the name doesn't already end with a
-            # legit corporate suffix
-            if not any(up.endswith(t) for t in _GARBLE_LEGIT_TAILS):
-                return True
-
-    return False
+    return _has_single_char_stub(name.strip().upper())
 
 
 def _looks_partial_address(name: str) -> bool:
@@ -488,17 +580,41 @@ def analyze_single_transcript(fields: TranscriptFields,
             score_impact=25,
         ))
 
-    if _looks_truncated(fields.employer_name or ""):
+    # Employer-name analysis. Real IRS transcripts already truncate
+    # employer names into 3-4 char word groups (e.g. "EIGR IN",
+    # "MARY ACAD", "INNO GENO LLC") — per Myssy 2026-07-13. So we
+    # cannot flag a single name as "truncated" without false positives.
+    # Instead we look for anomalies across ALL employer names in the doc:
+
+    all_names = fields.employer_names_all or ([fields.employer_name]
+                                              if fields.employer_name else [])
+    all_names = [n for n in all_names if n]
+
+    # Anomaly 1: any employer name ends with a single-character word
+    # ("BYER ENGI C") — IRS truncation leaves 2-4 char stubs, never 1.
+    single_stub_names = [n for n in all_names if _has_single_char_stub(n)]
+    if single_stub_names:
         flags.append(TranscriptFlag(
-            title="Truncated / Garbled Employer Name",
+            title="Over-Clipped Employer Name",
             description=(
-                f'Employer name "{fields.employer_name}" appears truncated or '
-                "garbled (e.g. missing LLC/INC suffix). Genuine IRS transcripts "
-                "show the full legal entity name."
+                f"Employer name(s) {single_stub_names!r} end with a "
+                "single-character word. Genuine IRS transcripts truncate "
+                "employer names into 3-4 character word groups, never "
+                "leaving a lone 1-char stub. This is the clipping pattern "
+                "seen when a fabricator manually edits the PDF and drops "
+                "characters mid-word."
             ),
             severity="warning",
             score_impact=20,
         ))
+
+    # Note: we experimented with a "mixed truncation" flag (fires when
+    # some names have a fully-spelled corporate suffix like "LLC" and
+    # others are truncated). It produced a false positive on the clean
+    # Maryville sample which has both 'EIGR IN' (truncated) and
+    # 'INNO GENO LLC' (full suffix). Real IRS output is not internally
+    # consistent — 3-char suffixes fit the "3-4 char word group" rule
+    # and print unclipped. Removed until we have more clean samples.
 
     # ---- Myssy 2026-07-13 (Christopher Nicola) signals ----
 
@@ -752,6 +868,7 @@ def analyze_files(file_paths: List[str]) -> Dict[str, Any]:
                 "tin_provided": f.tin_provided,
                 "tax_period": f.tax_period,
                 "employer_name": f.employer_name,
+                "employer_names_all": f.employer_names_all,
                 "has_masthead": f.has_masthead,
                 "has_title": f.has_title,
                 "w2_section_count": f.w2_section_count,

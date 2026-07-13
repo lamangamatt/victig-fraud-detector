@@ -55,19 +55,18 @@ def main() -> int:
     if missing_batch:
         failures.append(f"Missing batch flags: {missing_batch}")
 
-    # Per-document: each doc should carry its own duplicate-header flag
-    # and truncated employer-name flag
+    # Per-document: each doc should carry its own duplicate-header flag.
+    # (The old "Truncated / Garbled Employer Name" per-doc flag was
+    # dropped 2026-07-13 after Myssy clarified that IRS truncation of
+    # names into 3-4 char word groups is normal — see improvements_from_myssy.md.
+    # The KCC/Excalibur forgery is still caught here via the batch
+    # tracking-number checks and wage-bar redaction.)
     for doc in report["documents"]:
         titles = _flag_titles(doc["flags"])
         if "Duplicate IRS Transcript Header" not in titles:
             failures.append(
                 f"{os.path.basename(doc['file'])}: missing "
                 f"'Duplicate IRS Transcript Header'"
-            )
-        if "Truncated / Garbled Employer Name" not in titles:
-            failures.append(
-                f"{os.path.basename(doc['file'])}: missing "
-                f"'Truncated / Garbled Employer Name'"
             )
         if doc["risk_level"] != "HIGH":
             failures.append(

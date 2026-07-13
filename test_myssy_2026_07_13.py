@@ -57,6 +57,7 @@ def main():
         'Truncated "Submission Type" Values',
         '"Non-Employment Information Redacted" Replacement Box',
         "Missing Response Date on IRS Transcript",
+        "Over-Clipped Employer Name",  # BYER ENGI C — 1-char stub
     }
     missing = required - titles
     if missing:
@@ -78,6 +79,20 @@ def main():
         )
     if fields["request_date"] is None:
         errors.append("Expected request_date to still be parsed from the header")
+
+    # Verify the new employer-names-all extractor caught all three employers
+    all_names = fields.get("employer_names_all", [])
+    expected_min_names = 3
+    if len(all_names) < expected_min_names:
+        errors.append(
+            f"Expected >={expected_min_names} employer names extracted, "
+            f"got {len(all_names)}: {all_names}"
+        )
+    if not any(n.strip().split()[-1] == "C" for n in all_names if n.split()):
+        errors.append(
+            f"Expected 'BYER ENGI C' (single-char stub) in employer_names_all, "
+            f"got {all_names}"
+        )
 
     if errors:
         print("FAIL")

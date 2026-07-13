@@ -471,3 +471,81 @@ firing 7 other flags without needing employer-name analysis.
 that the three critical/near-critical new flags fire.
 
 *Changes implemented by Molesley, 2026-07-13*
+
+---
+
+## 2026-07-13 Follow-Up — Employer-Name Heuristic Rework
+
+### Background
+The 2026-07-13 pass shipped a "deferred item" note about Myssy's signal
+#5 ("Typically the employer names now come truncated into groups of 3
+or 4 for each word of the name. These are not all doing that."). This
+follow-up reworked that heuristic properly.
+
+### The Problem
+The original `_looks_truncated()` heuristic assumed truncated employer
+names = fraud. But Myssy's actual observation is that **the IRS itself
+truncates employer names into 3-4 char word groups**. So the old
+heuristic was fragile:
+
+- It fired on `KURT CARS CONS LL` (KCC forgery) — correct, but
+  incidentally, because the fabricator happened to use IRS-style truncation.
+- It fired on `EIGR IN` (clean IRS Maryville sample) — false positive,
+  but was masked by a parser bug that returned the EIN `XX-XXX3061`
+  instead of the entity name.
+
+### What Changed
+
+1. **Parser fix**: `TranscriptFields.employer_name` now reliably
+   extracts the entity name after the EIN label+value rows. Old
+   regex only looked one line ahead; new regex handles both
+   label-then-value and label-value-interleaved OCR layouts.
+
+2. **New field**: `employer_names_all` — list of every unique employer
+   entity name across the document. Exposed in the report dict.
+
+3. **New extractor**: `_extract_all_employer_names(text)` — line-by-line
+   scanner that skips EIN-value rows and address rows.
+
+4. **Deprecated `_looks_truncated`**: shrunk to only detect
+   single-character trailing stubs (`BYER ENGI C`). Previously it
+   also fired on 2-char stubs like `IN`/`LL`, which turned out to be
+   legitimate IRS truncation of INC/LLC.
+
+5. **New rule: `Over-Clipped Employer Name`** (warning, +20) — fires
+   when any employer name in the document ends with a 1-char word
+   (like the `C` in `BYER ENGI C` on the Nicola sample). IRS
+   truncation always leaves 2-4 char stubs. Fired on Nicola.
+
+6. **Rejected rule: "Inconsistent truncation"** — attempted a rule
+   that fires when some names have fully-spelled suffixes (`LLC`)
+   and others are truncated. Turned out to produce false positives
+   on the clean Maryville sample (`EIGR IN` + `INNO GENO LLC`).
+   Real IRS output is not internally consistent, since 3-char
+   suffixes fit the 3-4 char rule and print unclipped. Removed.
+
+### Test Changes
+
+- `test_myssy_2026_07_07.py`: removed assertion that
+  `Truncated / Garbled Employer Name` fires per-doc (KCC and
+  Excalibur don't have 1-char stubs). KCC/Excalibur are still caught
+  as HIGH/100 via the batch tracking-number and wage-bar checks.
+- `test_myssy_2026_07_13.py`: added assertions that
+  `Over-Clipped Employer Name` fires and that `employer_names_all`
+  extracts all three Nicola employers including `BYER ENGI C`.
+
+### Test Results After Rework
+- July 3: PASS
+- July 7 forgery batch: PASS, HIGH/100
+- July 8 clean Maryville: PASS, LOW/0 (zero flags — false positive gone)
+- July 13 Nicola: PASS, HIGH/100 with 8 flags (was 7)
+
+### Notes for Future Improvement
+With more clean IRS transcript samples in hand we could revisit:
+- Detecting truncation patterns that violate the 3-4 char rule
+  (e.g. names with 5+ char words). Currently unclear whether IRS
+  ever emits those.
+- Visual/layout-level differences that OCR text extraction misses
+  (font, spacing, right-justification of Submission Type).
+
+*Changes implemented by Molesley, 2026-07-13*
