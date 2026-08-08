@@ -62,9 +62,13 @@ except ImportError:
 class DocumentAnalyzer:
     """Enhanced document fraud detection with AI capabilities."""
     
-    # Known legitimate payroll software
+    # Known legitimate payroll software.  Keys are LOWER-CASED substrings
+    # matched against PDF creator/producer/software fields.  Include full
+    # brand names in addition to the acronym: ADP outputs identify as
+    # "Automatic Data Processing" in PDF metadata, not "ADP".
     LEGITIMATE_CREATORS = {
         'adp': 'ADP Payroll',
+        'automatic data processing': 'ADP Payroll',
         'paychex': 'Paychex',
         'gusto': 'Gusto',
         'workday': 'Workday',
@@ -217,6 +221,7 @@ class DocumentAnalyzer:
         self.use_ai = use_ai and HAS_ANTHROPIC and os.environ.get('ANTHROPIC_API_KEY')
         self.redactions_detected = False
         self.redaction_tool_used = None
+        self._metadata: Dict = {}
         self.ai_client = anthropic.Anthropic() if self.use_ai else None
         
     def analyze(self, file_path: str, doc_type: str = "Pay Stub") -> Dict[str, Any]:
@@ -225,6 +230,7 @@ class DocumentAnalyzer:
         self.risk_score = 0
         self.redactions_detected = False
         self.redaction_tool_used = None
+        self._metadata = {}
         
         results = {
             'file_path': file_path,
@@ -255,6 +261,11 @@ class DocumentAnalyzer:
             text = self._ocr_image(file_path) if HAS_TESSERACT else ""
             image = Image.open(file_path)
             results['metadata']['file_type'] = 'Image'
+        
+        # Store metadata for downstream helper checks (producer-aware suppression
+        # of visual/formatting flags that misfire on pre-printed IRS forms
+        # overprinted with payroll data — Intuit, ADP, Paychex, etc.).
+        self._metadata = results['metadata']
         
         # Store image for AI analysis
         self._current_image = image
@@ -679,7 +690,23 @@ class DocumentAnalyzer:
                     -25  # Increased bonus from -15 - legitimate sources should offset other flags
                 )
                 return
-    
+
+    def _has_legitimate_producer(self) -> bool:
+        """True when PDF metadata identifies a known payroll system producer.
+
+        Used by visual/formatting checks that expect a clean single-pass
+        digital print but legitimately misfire on pre-printed IRS forms
+        overprinted with payroll data (Intuit W-2s, ADP paystubs, etc.).
+        Only checks producer/creator/software; does not read text.
+        """
+        meta = self._metadata or {}
+        combined = ' '.join([
+            (meta.get('creator') or '').lower(),
+            (meta.get('producer') or '').lower(),
+            (meta.get('software') or '').lower(),
+        ])
+        return any(key in combined for key in self.LEGITIMATE_CREATORS)
+
     def _check_file_anomalies(self, file_path: str, metadata: Dict):
         """Check for file-level anomalies."""
         ext = Path(file_path).suffix.lower()
@@ -804,7 +831,20 @@ class DocumentAnalyzer:
             )
     
     def _detect_visual_redactions(self, image) -> bool:
-        """Detect black boxes or marker redactions in an image."""
+        """Detect solid black-bar redaction marks in an image.
+
+        Old behavior counted any row containing a 20+ pixel dark run and
+        fired on the 5th row. That triggers on every printed heading, totals
+        bar, or shaded table cell in a real paystub. This rewrite requires
+        an actual 2D contiguous dark BLOCK (both wide AND tall AND mostly
+        solid) — what a real black-bar redaction looks like.
+
+        Fires only when a candidate block is:
+          • >= 40 px wide  (SSN/account fields are wider than a character)
+          • >= 12 px tall  (covers at least one line of text)
+          • density > 0.75 solid dark inside the bounding box
+          • aspect ratio wider than 1.5 (bars are wider than tall)
+        """
         try:
             if isinstance(image, bytes):
                 img = Image.open(io.BytesIO(image))
@@ -812,39 +852,91 @@ class DocumentAnalyzer:
                 img = Image.open(image)
             else:
                 img = image
-            
-            # Convert to grayscale
+
             gray = img.convert('L')
             img_array = np.array(gray)
-            
-            # Look for large dark rectangular regions (black boxes)
-            # These are typically redaction marks
-            dark_threshold = 30  # Very dark pixels
-            dark_pixels = img_array < dark_threshold
-            
-            # Check if there are concentrated dark regions (potential redaction boxes)
-            # This is a simplified check - looking for horizontal runs of dark pixels
-            rows_with_dark_runs = 0
-            for row in dark_pixels:
-                # Look for runs of 20+ consecutive dark pixels
-                run_length = 0
-                max_run = 0
-                for pixel in row:
-                    if pixel:
-                        run_length += 1
-                        max_run = max(max_run, run_length)
+            dark_threshold = 30
+            dark = img_array < dark_threshold
+
+            # If the image is huge, downsample to keep this fast
+            h, w = dark.shape
+            scale = 1
+            if max(h, w) > 2000:
+                scale = 2
+                dark = dark[::scale, ::scale]
+                h, w = dark.shape
+
+            # Try scipy connected-components first (preferred).
+            try:
+                from scipy import ndimage
+                labeled, num = ndimage.label(dark)
+                if num == 0:
+                    return False
+                bboxes = ndimage.find_objects(labeled)
+                for i, bbox in enumerate(bboxes, start=1):
+                    if bbox is None:
+                        continue
+                    r_slice, c_slice = bbox
+                    height = (r_slice.stop - r_slice.start) * scale
+                    width  = (c_slice.stop - c_slice.start) * scale
+                    # Must be a wide, tall, wider-than-tall block
+                    if height < 12 or width < 40:
+                        continue
+                    if width / max(height, 1) < 1.5:
+                        continue
+                    # And its bounding box must be mostly solid dark
+                    region = dark[r_slice, c_slice]
+                    density = float(region.sum()) / max(region.size, 1)
+                    if density > 0.75:
+                        return True
+                return False
+            except ImportError:
+                pass
+
+            # Fallback (no scipy): stricter version of the old row-run heuristic.
+            # Require many consecutive rows at the SAME column position to
+            # avoid firing on scattered dark text.
+            min_run = 40
+            band_start = None
+            band_start_col = None
+            band_length = 0
+            for row_idx in range(h):
+                row = dark[row_idx]
+                # find longest run and its start
+                run = 0
+                best = 0
+                best_start = -1
+                start = -1
+                for c_idx in range(w):
+                    if row[c_idx]:
+                        if run == 0:
+                            start = c_idx
+                        run += 1
+                        if run > best:
+                            best = run
+                            best_start = start
                     else:
-                        run_length = 0
-                if max_run >= 20:
-                    rows_with_dark_runs += 1
-            
-            # If multiple rows have dark runs, likely a redaction box
-            if rows_with_dark_runs >= 5:
-                return True
-                
+                        run = 0
+                if best >= min_run:
+                    if band_start is None:
+                        band_start = row_idx
+                        band_start_col = best_start
+                        band_length = 1
+                    elif abs(best_start - band_start_col) <= 5:
+                        band_length += 1
+                    else:
+                        band_start = row_idx
+                        band_start_col = best_start
+                        band_length = 1
+                    if band_length >= 12:
+                        return True
+                else:
+                    band_start = None
+                    band_length = 0
+
         except Exception:
             pass
-        
+
         return False
     
     def _check_text_anomalies(self, text: str, doc_type: str):
@@ -1132,36 +1224,75 @@ class DocumentAnalyzer:
 
         Trigger: 3+ money fields present AND fewer than 50% contain a decimal.
         Severity: critical  |  Score impact: +40
-        """
-        # Collect all candidate monetary amounts from the OCR text.
-        # We look for sequences of digits (with optional commas) that appear in
-        # contexts typical of W-2 box values.  We accept amounts even without a
-        # leading $ because OCR often drops the dollar sign on scanned forms.
-        #
-        # Strategy:
-        #   1. Find every occurrence of a standalone number (2-6 digits,
-        #      optionally with comma-grouping) that looks like a dollar amount.
-        #   2. Separately count how many of those have an explicit ".dd" suffix.
-        #   3. If 3+ found and <50% have decimals → flag.
 
-        # Pattern A: values that definitely have decimals
+        2026-08-07 refinement: only scan the form-data zone (before IRS
+        "Notice to Employee" / "Instructions for Employee" / "Future
+        developments" narrative) and only count integers on lines that
+        actually look like form values — excluding EIN/SSN/phone/state-ID
+        patterns, address lines, and lines dominated by letters.  Previous
+        version scored every IRC section code (401, 403, 457, 4137, 8839…)
+        and box-label number in the employee instructions as a "missing
+        decimal" amount, driving false positives on legitimate Intuit W-2s.
+        """
+        # Step 1: trim off the IRS narrative section — that is where
+        # publication references, IRC codes, and form-1040 mentions live.
+        narrative_marker = re.search(
+            r'(Future developments\.|Notice to Employee|Instructions for Employee)',
+            text,
+            re.IGNORECASE
+        )
+        scan_text = text[:narrative_marker.start()] if narrative_marker else text
+
+        # Step 2: Pattern A — values that clearly have decimals
         decimal_amounts = re.findall(
             r'(?<![\d.])\d{1,6}(?:,\d{3})*\.\d{2}(?![\d.])',
-            text
+            scan_text
         )
 
-        # Pattern B: values that look like money but have NO decimal
-        # (standalone integers that are plausibly a dollar amount 1-999999)
-        no_decimal_amounts = re.findall(
-            r'(?<![\d.,])(?<!\.)(\d{2,6})(?![\d.,])',
-            text
-        )
-        # Filter to plausible wage/tax amounts (>= 1, exclude years/zip codes)
-        no_decimal_filtered = [
-            v for v in no_decimal_amounts
-            if 1 <= int(v) <= 200000 and not re.match(r'^(19|20)\d{2}$', v)
-            and not re.match(r'^\d{5}$', v)  # exclude zip codes
-        ]
+        # Step 3: Pattern B — candidate no-decimal integers, but only from
+        # lines that plausibly hold a form value (short, mostly numeric,
+        # not an ID/address/label). This is the anti-false-positive filter.
+        no_decimal_filtered: list = []
+        for raw_line in scan_text.split('\n'):
+            line = raw_line.strip()
+            if not line or not any(c.isdigit() for c in line):
+                continue
+            # Skip ID-shaped lines: EIN (##-#######), SSN mask, phone,
+            # state ID with 2+ hyphen groups. These are digit-heavy but not
+            # dollar amounts.
+            if re.fullmatch(r'[\dXx\*\-\s\.]+', line) and line.count('-') >= 1:
+                continue
+            # Skip lines that reference the OMB control number.
+            if 'OMB' in line:
+                continue
+            # Skip Copy A/B/C/1/2/D headers.
+            if re.search(r'Cop[yi]\s*[ABCD12]\b', line, re.IGNORECASE):
+                continue
+            # Skip lines that mention Form W-2 / Wage and Tax Statement (these
+            # frequently sit next to the year, e.g. "Form W-2 2025").
+            if re.search(r'(form\s*w-?2|wage\s*and\s*tax\s*statement)', line, re.IGNORECASE):
+                continue
+            # Skip lines dominated by letters (labels, addresses, city names,
+            # box captions like "1 Wages, tips, other compensation").
+            letters = sum(1 for c in line if c.isalpha())
+            if len(line) > 0 and letters / len(line) > 0.30:
+                continue
+
+            # Extract candidate integer amounts from this line.
+            for v in re.findall(r'(?<![\d.,])(?<!\.)(\d{2,6})(?![\d.,])', line):
+                try:
+                    iv = int(v)
+                except ValueError:
+                    continue
+                # Real wage/tax amounts are >= $100 in practice; below that
+                # is almost always a box number or IRC code.
+                if iv < 100 or iv > 200000:
+                    continue
+                if re.match(r'^(19|20)\d{2}$', v):
+                    continue  # year
+                if re.match(r'^\d{5}$', v):
+                    continue  # 5-digit zip
+                no_decimal_filtered.append(v)
 
         total_fields = len(decimal_amounts) + len(no_decimal_filtered)
         if total_fields >= 3:
@@ -1189,6 +1320,12 @@ class DocumentAnalyzer:
         number" headers.  Two or more triggers the flag.
 
         Severity: warning  |  Score impact: +25
+
+        2026-08-07 refinement: the IRS-published multi-copy layout (Copy A,
+        B, C, D, 1, 2) legitimately puts several W-2 headers on one page for
+        the SAME employer.  When distinct EIN count is 1 (or 0) and we can
+        see multiple Copy markers, this is the standard multi-copy print,
+        not a composite forgery, and the flag is suppressed.
         """
         # Count distinct EIN values (format: ##-#######)
         eins_found = re.findall(r'\b\d{2}-\d{7}\b', text)
@@ -1208,8 +1345,24 @@ class DocumentAnalyzer:
             re.IGNORECASE
         )
 
+        # Detect standard multi-copy layout markers (Copy A, B, C, D, 1, 2).
+        # Also accept boilerplate phrases like "Copies B, C, and 2".
+        copy_markers = re.findall(r'Cop[yi]\s*([ABCD12])\b', text, re.IGNORECASE)
+        unique_copies = {c.upper() for c in copy_markers}
+        copies_reference = bool(re.search(
+            r'Copies\s+[ABCD0-9,\s]+and\s+[ABCD0-9]',
+            text,
+            re.IGNORECASE
+        ))
+        legit_multi_copy_layout = len(unique_copies) >= 2 or copies_reference
+
         multiple_eins    = len(unique_eins) >= 2
         multiple_headers = len(employer_headers) >= 2 or len(w2_headers) >= 2
+
+        # Suppression: SAME employer (0 or 1 EIN) + standard multi-copy layout
+        # = normal IRS-published multi-copy print, not a forgery.
+        if not multiple_eins and legit_multi_copy_layout:
+            return
 
         if multiple_eins or multiple_headers:
             details = []
@@ -1854,24 +2007,45 @@ class DocumentAnalyzer:
                 # High standard deviation in text darkness indicates multiple print passes
                 # Legitimate single-pass prints have consistent ink density
                 # Calibrated against Myssy's samples: legit=50.1, fraud=51-59
+                #
+                # 2026-08-07 refinement: pre-printed IRS W-2 forms overprinted
+                # with payroll data (Intuit, ADP, Paychex…) legitimately show two
+                # distinct darkness levels — the dark form template plus the
+                # medium payroll data.  When the producer is a known payroll
+                # system, downgrade darkness flags to "info" or suppress entirely.
+                legit_producer = self._has_legitimate_producer()
                 if text_std > 55:
-                    self._add_flag(
-                        'Inconsistent Text Darkness',
-                        f'Text appears in multiple shades of black (std dev: {text_std:.1f}). '
-                        f'This pattern often indicates printing over an existing template or multiple print passes.',
-                        'warning',
-                        20
-                    )
-                    results['anomalies'].append('Multiple ink densities detected')
+                    if legit_producer:
+                        # Expected for pre-printed IRS forms + payroll overprint
+                        self._add_flag(
+                            'Expected Text Darkness Variance (Pre-Printed Form)',
+                            f'Text darkness variance (std dev: {text_std:.1f}) is consistent with a '
+                            f'pre-printed IRS form overprinted with payroll data — expected for output '
+                            f'from a known payroll system.',
+                            'info',
+                            0
+                        )
+                    else:
+                        self._add_flag(
+                            'Inconsistent Text Darkness',
+                            f'Text appears in multiple shades of black (std dev: {text_std:.1f}). '
+                            f'This pattern often indicates printing over an existing template or multiple print passes.',
+                            'warning',
+                            20
+                        )
+                        results['anomalies'].append('Multiple ink densities detected')
                 elif text_std > 50:
-                    # Borderline - note but don't heavily penalize
-                    self._add_flag(
-                        'Slightly Elevated Text Variance',
-                        f'Text darkness shows moderate variation (std dev: {text_std:.1f}). '
-                        f'Worth reviewing but may be normal scanning artifacts.',
-                        'info',
-                        5
-                    )
+                    if legit_producer:
+                        pass  # not worth noting at this level for legit sources
+                    else:
+                        # Borderline - note but don't heavily penalize
+                        self._add_flag(
+                            'Slightly Elevated Text Variance',
+                            f'Text darkness shows moderate variation (std dev: {text_std:.1f}). '
+                            f'Worth reviewing but may be normal scanning artifacts.',
+                            'info',
+                            5
+                        )
                 
                 # Also check for bimodal distribution (two distinct darkness levels)
                 # This is a stronger indicator of template overlay
@@ -1885,15 +2059,21 @@ class DocumentAnalyzer:
                     if len(dark_text) > 100 and len(medium_text) > 100:
                         dark_ratio = len(medium_text) / len(dark_text)
                         if 0.3 < dark_ratio < 4:  # Both groups are substantial
-                            self._add_flag(
-                                'Bimodal Text Darkness Pattern',
-                                f'Document contains two distinct levels of text darkness '
-                                f'(dark: {len(dark_text)} px, medium: {len(medium_text)} px). '
-                                f'This is a strong indicator of text being overlaid on an existing form.',
-                                'critical',
-                                30
-                            )
-                            results['anomalies'].append('Bimodal darkness distribution (template overlay likely)')
+                            if legit_producer:
+                                # Known payroll systems print onto pre-printed IRS forms,
+                                # which is exactly what a bimodal distribution looks like.
+                                # Not evidence of tampering.
+                                pass
+                            else:
+                                self._add_flag(
+                                    'Bimodal Text Darkness Pattern',
+                                    f'Document contains two distinct levels of text darkness '
+                                    f'(dark: {len(dark_text)} px, medium: {len(medium_text)} px). '
+                                    f'This is a strong indicator of text being overlaid on an existing form.',
+                                    'critical',
+                                    30
+                                )
+                                results['anomalies'].append('Bimodal darkness distribution (template overlay likely)')
         except Exception as e:
             results['error'] = str(e)
         
