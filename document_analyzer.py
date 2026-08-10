@@ -1,6 +1,18 @@
 """
-Document Analyzer v2.3
-Enhanced fraud detection with AI vision analysis for employment documents.
+Document Analyzer v2.5
+Enhanced fraud detection with AI vision analysis for employment AND education documents.
+
+v2.5 Updates (August 10, 2026):
+- Added Diploma, Transcript, and Professional License/Certification document types
+- Diploma mill detection against documented US Dept of Ed / Oregon ODA lists
+- Recognized US accreditor detection (regional and programmatic)
+- Transcript GPA math validation against extracted courses
+- Latin honors GPA threshold validation (cum laude, magna, summa)
+- Legitimate education source recognition (Parchment, National Student
+  Clearinghouse, MyCreds, Ellucian, Workday Student, etc.)
+- Professional certification issuer recognition (AICPA, PMI, ISACA,
+  state licensing bodies, medical boards, bar associations)
+- Education-specific AI vision prompt (skips W-2/box-numbering noise)
 
 v2.3 Updates (June 19, 2026 - based on Myssy Clayson's input):
 - Added structural box-numbering checks (e.g., three "13" boxes without a/b/c suffixes)
@@ -214,7 +226,178 @@ class DocumentAnalyzer:
         (609350, 0.35, 0.42),   # 35% bracket - expect 32-42%
         (float('inf'), 0.37, 0.45),  # 37% bracket
     ]
-    
+
+    # ==========================================================
+    # EDUCATION DOCUMENT VERIFICATION (v2.5)
+    # ==========================================================
+    # Support for diplomas, academic transcripts, and
+    # professional licenses/certifications.
+
+    # Legitimate education document exchange platforms and
+    # student information systems. If a diploma or transcript
+    # was produced by one of these, it is a strong positive signal.
+    LEGITIMATE_EDUCATION_SOURCES = {
+        'parchment': 'Parchment',
+        'national student clearinghouse': 'National Student Clearinghouse',
+        'studentclearinghouse': 'National Student Clearinghouse',
+        'mycreds': 'MyCreds (ARUCC)',
+        'credentials solutions': 'Credentials Solutions',
+        'credentialsinc': 'Credentials Solutions',
+        'scrip-safe': 'Scrip-Safe',
+        'scripsafe': 'Scrip-Safe',
+        'digitary': 'Digitary CORE',
+        'ellucian': 'Ellucian (Banner/Colleague)',
+        'banner': 'Ellucian Banner',
+        'colleague': 'Ellucian Colleague',
+        'workday student': 'Workday Student',
+        'peoplesoft campus': 'PeopleSoft Campus Solutions',
+        'jenzabar': 'Jenzabar',
+        'campus nexus': 'Campus Nexus',
+        'technolutions slate': 'Technolutions Slate',
+        'blackbaud education': 'Blackbaud Education',
+        'anthology': 'Anthology',
+    }
+
+    # Documented US diploma mills. Conservative list drawn from
+    # US GAO reports (GAO-04-1096T), Oregon Office of Degree
+    # Authorization unaccredited list, Michigan Dept of Education,
+    # and academic-integrity research (Ezell & Bear, 2005).
+    # NOTE: A hit here strongly implies fraud. Do not add real
+    # institutions to this list without documentation.
+    KNOWN_DIPLOMA_MILLS = {
+        'almeda university',
+        'almeda college',
+        'ashwood university',
+        'belford university',
+        'belford high school',
+        'columbia state university',
+        'concordia college and university',
+        'headway university',
+        'hill university',
+        'kensington university',
+        'lasalle university (louisiana)',
+        'nation university',
+        'panworld global university',
+        'preston university',
+        'rochville university',
+        'suffield college and university',
+        'thornhill university',
+        'trinity college and university',
+        'warnborough university',
+        'wexford university',
+        'woodfield university',
+        'canterbury university (usa)',
+        'university degree program',
+        'american university of london',
+    }
+
+    # US Department of Education recognized accreditors
+    # (institutional and specialized). A document mentioning
+    # one of these by name is a positive legitimacy signal.
+    US_ACCREDITORS = {
+        'middle states commission on higher education': 'MSCHE',
+        'new england commission of higher education': 'NECHE',
+        'higher learning commission': 'HLC',
+        'northwest commission on colleges and universities': 'NWCCU',
+        'southern association of colleges and schools': 'SACSCOC',
+        'wasc senior college and university commission': 'WSCUC',
+        'accrediting commission for community and junior colleges': 'ACCJC',
+        'accrediting bureau of health education schools': 'ABHES',
+        'accrediting council for continuing education and training': 'ACCET',
+        'accreditation council for business schools and programs': 'ACBSP',
+        'aacsb international': 'AACSB',
+        'abet': 'ABET (Engineering/CS)',
+        'liaison committee on medical education': 'LCME',
+        'american bar association': 'ABA (Law)',
+        'accreditation commission for education in nursing': 'ACEN',
+        'commission on collegiate nursing education': 'CCNE',
+        'commission on accreditation of allied health education programs': 'CAAHEP',
+    }
+
+    # Standard Latin honors thresholds on US 4.0 GPA scale.
+    # Institutions vary but these are the most-cited minimums;
+    # a claim below these is a validation signal, not proof.
+    LATIN_HONORS_THRESHOLDS = {
+        'summa cum laude': 3.90,
+        'magna cum laude': 3.70,
+        'cum laude': 3.50,
+        'with highest honors': 3.75,
+        'with high honors': 3.50,
+        'with honors': 3.30,
+    }
+
+    # Standard US degree abbreviations (used to sanity-check
+    # abbreviated degree names on diplomas).
+    STANDARD_DEGREE_ABBREVIATIONS = {
+        'aa', 'as', 'aas',
+        'ba', 'bs', 'bba', 'bfa', 'bsn', 'beng', 'bsc', 'bsw',
+        'ma', 'ms', 'mba', 'mfa', 'msn', 'meng', 'msc',
+        'mph', 'msw', 'med',
+        'phd', 'edd', 'psyd', 'dnp', 'dsc', 'dpt', 'dma',
+        'jd', 'md', 'do', 'dds', 'dvm', 'pharmd',
+        'llm', 'llb', 'sjd',
+    }
+
+    # Phrases strongly associated with diploma mills and
+    # fabricated credentials.
+    SUSPICIOUS_EDUCATION_PHRASES = [
+        ('life experience degree', 45),
+        ('based on life experience', 45),
+        ('no attendance required', 40),
+        ('no coursework required', 40),
+        ('degree in one day', 50),
+        ('instant degree', 50),
+        ('purchased degree', 50),
+        ('based on prior learning only', 35),
+        ('non-traditional accreditation', 30),
+        ('internationally accredited', 20),  # Vague claim, verify specific accreditor
+        ('globally recognized (self)', 25),
+        ('honorary doctorate', 15),  # Real, but rarely relevant to employment verification
+    ]
+
+    # Recognized professional certification / licensing bodies.
+    LEGITIMATE_CERTIFICATION_ISSUERS = {
+        'aicpa': 'AICPA (CPA)',
+        'nasba': 'NASBA (CPA)',
+        'ncees': 'NCEES (PE/FE Engineering)',
+        'pmi': 'PMI (PMP/CAPM)',
+        'axelos': 'AXELOS (ITIL/PRINCE2)',
+        'comptia': 'CompTIA',
+        'isc2': '(ISC)² (CISSP)',
+        '(isc)²': '(ISC)²',
+        'isaca': 'ISACA (CISA/CISM)',
+        'sans': 'SANS/GIAC',
+        'giac': 'GIAC',
+        'aws certification': 'AWS Certification',
+        'amazon web services': 'AWS Certification',
+        'microsoft certified': 'Microsoft Certification',
+        'cisco certified': 'Cisco Certification',
+        'google cloud': 'Google Cloud Certification',
+        'salesforce certified': 'Salesforce',
+        'shrm': 'SHRM (HR)',
+        'hrci': 'HRCI (HR)',
+        'nabp': 'NABP (Pharmacy)',
+        'ancc': 'ANCC (Nursing)',
+        'aana': 'AANA (Anesthesia)',
+        'nbcot': 'NBCOT (Occupational Therapy)',
+        'apta': 'APTA (Physical Therapy)',
+        'asha': 'ASHA (Speech-Language Pathology)',
+        'american board of': 'American Board (medical specialty)',
+        'state bar of': 'State Bar Association',
+        'the florida bar': 'The Florida Bar',
+        'state licensing board': 'State Licensing Board',
+        'department of professional regulation': 'State Department of Professional Regulation',
+    }
+
+    # Standard letter-grade to grade-point mapping (4.0 scale)
+    GRADE_POINT_MAP = {
+        'A+': 4.0, 'A': 4.0, 'A-': 3.7,
+        'B+': 3.3, 'B': 3.0, 'B-': 2.7,
+        'C+': 2.3, 'C': 2.0, 'C-': 1.7,
+        'D+': 1.3, 'D': 1.0, 'D-': 0.7,
+        'F': 0.0, 'E': 0.0,
+    }
+
     def __init__(self, use_ai: bool = True):
         self.flags: List[Dict] = []
         self.risk_score = 0
@@ -304,6 +487,16 @@ class DocumentAnalyzer:
             elif doc_type == "1099":
                 # NEW: 1099 specific validation
                 results['math_validation'] = self._validate_1099(text, results['extracted_data'])
+            elif doc_type in ("Diploma", "Transcript", "Professional License/Certification", "Diploma/Transcript"):
+                # v2.5: Education documents
+                self._check_education_source(results['metadata'])
+                if doc_type == "Transcript":
+                    results['math_validation'] = self._validate_transcript(text, results['extracted_data'])
+                elif doc_type == "Professional License/Certification":
+                    results['math_validation'] = self._validate_certification(text, results['extracted_data'])
+                else:
+                    # "Diploma" and legacy "Diploma/Transcript" both fall through here
+                    results['math_validation'] = self._validate_diploma(text, results['extracted_data'])
         
         # Visual/forensic analysis
         if image:
@@ -1670,9 +1863,609 @@ class DocumentAnalyzer:
                         data[field] = float(val)
                     except:
                         data[field] = val
-        
+
+        # Education documents (v2.5)
+        elif doc_type == "Diploma" or doc_type == "Diploma/Transcript":
+            data.update(self._extract_diploma_data(text))
+        elif doc_type == "Transcript":
+            data.update(self._extract_transcript_data(text))
+        elif doc_type == "Professional License/Certification":
+            data.update(self._extract_certification_data(text))
+
         return data
-    
+
+    # ==========================================================
+    # EDUCATION EXTRACTION (v2.5)
+    # ==========================================================
+
+    def _extract_diploma_data(self, text: str) -> Dict:
+        """Extract structured data from a diploma / degree certificate."""
+        data: Dict[str, Any] = {}
+        text_norm = text.strip()
+
+        # Institution name - try several common patterns (case-insensitive:
+        # "University", "UNIVERSITY", "university" are all valid).
+        inst_patterns = [
+            r'((?:the\s+)?university\s+of\s+[A-Za-z][A-Za-z\s\'-]{2,50})',
+            r'([A-Za-z][A-Za-z\s\'-]{2,50}\s+state\s+university)',
+            r'([A-Za-z][A-Za-z\s\'-]{2,50}\s+university)',
+            r'([A-Za-z][A-Za-z\s\'-]{2,50}\s+institute\s+of\s+technology)',
+            r'([A-Za-z][A-Za-z\s\'-]{2,50}\s+college)',
+            r'([A-Za-z][A-Za-z\s\'-]{2,50}\s+academy)',
+        ]
+        for pat in inst_patterns:
+            m = re.search(pat, text_norm, re.I)
+            if m:
+                candidate = m.group(1).strip()
+                # Reject obvious noise (single words, all-caps OCR runs, etc.)
+                if 4 <= len(candidate) <= 90 and ' ' in candidate:
+                    data['institution'] = candidate
+                    break
+
+        # GPA on the diploma face (rare but common with honors)
+        gpa_match = re.search(
+            r'(?:cumulative\s+)?g\.?p\.?a\.?[\s:]+(\d\.\d{1,3})',
+            text_norm,
+            re.I,
+        )
+        if gpa_match:
+            try:
+                val = float(gpa_match.group(1))
+                if 0 <= val <= 5:
+                    data['cumulative_gpa'] = val
+            except ValueError:
+                pass
+
+        # Degree phrase - full text (Bachelor of..., Master of..., Doctor of...)
+        degree_patterns = [
+            r'(bachelor\s+of\s+[A-Za-z\s]{2,40}?)(?=\s+(?:in|is|has|degree|and|with|,|\.|\n|$))',
+            r'(master\s+of\s+[A-Za-z\s]{2,40}?)(?=\s+(?:in|is|has|degree|and|with|,|\.|\n|$))',
+            r'(doctor\s+of\s+[A-Za-z\s]{2,40}?)(?=\s+(?:in|is|has|degree|and|with|,|\.|\n|$))',
+            r'(associate\s+of\s+[A-Za-z\s]{2,40}?)(?=\s+(?:in|is|has|degree|and|with|,|\.|\n|$))',
+            r'(juris\s+doctor)',
+        ]
+        for pat in degree_patterns:
+            m = re.search(pat, text_norm, re.I)
+            if m:
+                data['degree_type'] = m.group(1).strip()
+                break
+
+        # Field of study "in <field>"
+        if data.get('degree_type'):
+            field_match = re.search(
+                r'in\s+([A-Z][A-Za-z\s]{3,40}?)(?:\s+(?:with|and|,|\.|\n|$))',
+                text_norm,
+            )
+            if field_match:
+                data['field_of_study'] = field_match.group(1).strip()
+
+        # Latin honors
+        low = text_norm.lower()
+        for honor in self.LATIN_HONORS_THRESHOLDS.keys():
+            if honor in low:
+                data['honors'] = honor
+                break
+
+        # Conferred date / year
+        year_match = re.search(r'\b(19\d{2}|20\d{2})\b', text_norm)
+        if year_match:
+            try:
+                data['conferred_year'] = int(year_match.group(1))
+            except:
+                pass
+
+        return data
+
+    def _extract_transcript_data(self, text: str) -> Dict:
+        """Extract structured data from an academic transcript."""
+        data: Dict[str, Any] = {}
+
+        # Institution (case-insensitive)
+        for pat in [
+            r'((?:the\s+)?university\s+of\s+[A-Za-z][A-Za-z\s]{2,50})',
+            r'([A-Za-z][A-Za-z\s]{2,50}\s+(?:university|college|institute))',
+        ]:
+            m = re.search(pat, text, re.I)
+            if m:
+                data['institution'] = m.group(1).strip()
+                break
+
+        # Cumulative GPA
+        gpa_patterns = [
+            r'(?:cumulative|cum\.?|overall|final)\s+g\.?p\.?a\.?[:\s]+(\d+\.\d{1,3})',
+            r'g\.?p\.?a\.?[:\s]+(\d+\.\d{1,3})',
+            r'grade\s+point\s+average[:\s]+(\d+\.\d{1,3})',
+        ]
+        for pat in gpa_patterns:
+            m = re.search(pat, text, re.I)
+            if m:
+                try:
+                    val = float(m.group(1))
+                    if 0 <= val <= 5:
+                        data['cumulative_gpa'] = val
+                except:
+                    pass
+                break
+
+        # Total credits earned
+        for pat in [
+            r'total\s+credits?(?:\s+earned)?[:\s]+(\d{1,3}\.?\d?)',
+            r'credits?\s+earned[:\s]+(\d{1,3}\.?\d?)',
+            r'total\s+(?:units|hours)\s+earned[:\s]+(\d{1,3}\.?\d?)',
+        ]:
+            m = re.search(pat, text, re.I)
+            if m:
+                try:
+                    data['total_credits'] = float(m.group(1))
+                except:
+                    pass
+                break
+
+        # Degree awarded
+        deg_match = re.search(
+            r'degree\s+(?:awarded|conferred|earned)[:\s]+([A-Za-z\s\.,]+?)(?:\n|$)',
+            text,
+            re.I,
+        )
+        if deg_match:
+            data['degree_awarded'] = deg_match.group(1).strip()[:80]
+
+        # Extract course rows: <CODE ###> <NAME...> <CREDITS> <GRADE>
+        # Tesseract OCR of transcripts is imperfect; this is best-effort.
+        course_pattern = re.compile(
+            r'([A-Z]{2,5}\s?\d{3,4}[A-Z]?)\s+'         # course code
+            r'([A-Z][A-Za-z0-9\s&,\.\-\'/]{4,60}?)\s+'  # course name
+            r'(\d{1,2}\.?\d?)\s+'                        # credits
+            r'([A-F][+\-]?|P|NP|W|I|CR|NC)\b',           # grade
+        )
+        courses: List[Dict[str, Any]] = []
+        for code, name, credits, grade in course_pattern.findall(text)[:150]:
+            try:
+                courses.append({
+                    'code': code.strip(),
+                    'name': name.strip(),
+                    'credits': float(credits),
+                    'grade': grade.strip().upper(),
+                })
+            except:
+                continue
+        if courses:
+            data['courses'] = courses
+
+        # Accreditor mentioned?
+        low = text.lower()
+        for acc_key in self.US_ACCREDITORS.keys():
+            if acc_key in low:
+                data['accreditor_mentioned'] = self.US_ACCREDITORS[acc_key]
+                break
+
+        return data
+
+    def _extract_certification_data(self, text: str) -> Dict:
+        """Extract structured data from a professional license or certification."""
+        data: Dict[str, Any] = {}
+
+        # License / certification number - require at least one digit so we
+        # don't mistakenly grab "ified" out of "certifies", "cert" out of
+        # "certificate", etc.
+        for pat in [
+            r'(?:license|certification|certificate|cert)\s*(?:no\.?|number|#|id)[:\s]*([A-Z0-9][A-Z0-9\-]{3,20})',
+            r'(?:registration|reg\.?)\s*(?:no\.?|number)[:\s]*([A-Z0-9][A-Z0-9\-]{3,20})',
+            r'(?:credential|badge)\s*(?:id|number)[:\s]*([A-Z0-9][A-Z0-9\-]{3,25})',
+        ]:
+            m = re.search(pat, text, re.I)
+            if m:
+                candidate = m.group(1).strip()
+                # Must contain at least one digit to look like a real ID
+                if any(c.isdigit() for c in candidate):
+                    data['license_number'] = candidate
+                    break
+
+        # Issue date
+        issue_match = re.search(
+            r'(?:issued?|effective|awarded)(?:\s+(?:on|date))?[:\s]+([A-Za-z0-9,\s/-]{6,25})',
+            text,
+            re.I,
+        )
+        if issue_match:
+            data['issue_date'] = issue_match.group(1).strip()
+
+        # Expiration date
+        exp_match = re.search(
+            r'(?:expir(?:es|ation)|valid\s+(?:until|through))(?:\s+date)?[:\s]+([A-Za-z0-9,\s/-]{6,25})',
+            text,
+            re.I,
+        )
+        if exp_match:
+            data['expiration_date'] = exp_match.group(1).strip()
+
+        # Recognized issuer?
+        low = text.lower()
+        for key, name in self.LEGITIMATE_CERTIFICATION_ISSUERS.items():
+            if key in low:
+                data['issuer_recognized'] = name
+                break
+
+        return data
+
+    # ==========================================================
+    # EDUCATION VALIDATORS (v2.5)
+    # ==========================================================
+
+    def _check_education_source(self, metadata: Dict) -> bool:
+        """Positive signal: was this diploma/transcript produced by a known
+        education records platform (Parchment, Clearinghouse, MyCreds, Banner)?"""
+        creator = (metadata.get('creator', '') or '').lower()
+        producer = (metadata.get('producer', '') or '').lower()
+        software = (metadata.get('software', '') or '').lower()
+        combined = f"{creator} {producer} {software}"
+
+        for key, name in self.LEGITIMATE_EDUCATION_SOURCES.items():
+            if key in combined:
+                self._add_flag(
+                    f'Legitimate Education Source: {name}',
+                    f'Document originates from {name}, a recognized education records / secure credentialing platform. Strong positive legitimacy signal.',
+                    'info',
+                    -25,
+                )
+                return True
+        return False
+
+    def _validate_diploma(self, text: str, data: Dict) -> Dict:
+        """Validate a diploma / degree certificate."""
+        result = {'valid': True, 'checks': [], 'errors': []}
+        text_lower = text.lower()
+
+        # Check 1: Institution against documented diploma mills
+        institution = (data.get('institution') or '').lower()
+        if institution:
+            for mill in self.KNOWN_DIPLOMA_MILLS:
+                if mill in institution or (len(institution) > 5 and institution in mill):
+                    self._add_flag(
+                        'Known Diploma Mill',
+                        f'Institution "{data.get("institution")}" matches a documented US diploma mill '
+                        '(per GAO reports, Oregon ODA unaccredited list, and academic-integrity research). '
+                        'Degrees from this institution are not recognized for employment verification purposes.',
+                        'critical',
+                        50,
+                    )
+                    result['errors'].append({
+                        'check': 'Diploma Mill',
+                        'error': f'{data.get("institution")} is a documented diploma mill',
+                    })
+                    return result
+
+        # Check 2: Suspicious credential phrases anywhere
+        for phrase, score in self.SUSPICIOUS_EDUCATION_PHRASES:
+            if phrase in text_lower:
+                self._add_flag(
+                    'Suspicious Credential Language',
+                    f'Document contains phrase "{phrase}", which is strongly associated with diploma mills and fabricated credentials. Legitimate degrees are earned through completed coursework.',
+                    'critical',
+                    score,
+                )
+                result['errors'].append({'check': 'Language', 'error': phrase})
+                break
+
+        # Check 3: Recognized accreditor mentioned (positive signal)
+        for acc_key, acc_name in self.US_ACCREDITORS.items():
+            if acc_key in text_lower:
+                self._add_flag(
+                    f'Recognized Accreditor: {acc_name}',
+                    f'Document references {acc_name}, a US Department of Education recognized accreditor. Positive institutional legitimacy signal.',
+                    'info',
+                    -15,
+                )
+                result['checks'].append(f'Accreditor: {acc_name}')
+                break
+
+        # Check 4: Latin honors GPA sanity (both fields present)
+        honors = (data.get('honors') or '').lower()
+        if honors:
+            gpa = data.get('cumulative_gpa') or data.get('gpa')
+            if gpa and honors in self.LATIN_HONORS_THRESHOLDS:
+                required = self.LATIN_HONORS_THRESHOLDS[honors]
+                if gpa < required - 0.05:  # small tolerance
+                    self._add_flag(
+                        'Honors GPA Below Threshold',
+                        f'Document claims "{honors}" but GPA ({gpa:.2f}) is below the typical minimum ({required:.2f}). '
+                        'Institutions vary, but a gap this large warrants verification with the registrar.',
+                        'warning',
+                        20,
+                    )
+            result['checks'].append(f'Honors: {honors}')
+
+        # Check 5: Conferred-year sanity
+        conferred_year = data.get('conferred_year')
+        current_year = datetime.now().year
+        if conferred_year:
+            if conferred_year > current_year:
+                self._add_flag(
+                    'Future-Dated Degree',
+                    f'Diploma shows conferral year {conferred_year}, which is in the future. Fabricated.',
+                    'critical',
+                    45,
+                )
+            elif conferred_year < 1900:
+                self._add_flag(
+                    'Implausible Degree Year',
+                    f'Diploma shows conferral year {conferred_year}, which is implausibly old.',
+                    'warning',
+                    20,
+                )
+            else:
+                result['checks'].append(f'Conferred: {conferred_year}')
+
+        # Check 6: Degree-type nomenclature
+        degree_type = (data.get('degree_type') or '').lower()
+        if degree_type:
+            recognized_keywords = [
+                'bachelor', 'master', 'doctor', 'associate', 'juris',
+                'philosophy', 'science', 'arts', 'engineering', 'nursing',
+                'business administration', 'fine arts', 'social work',
+                'education', 'divinity', 'medicine', 'laws', 'letters',
+            ]
+            if not any(k in degree_type for k in recognized_keywords):
+                self._add_flag(
+                    'Unusual Degree Name',
+                    f'Degree "{data.get("degree_type")}" does not match standard US degree conventions. Verify authenticity with the institution.',
+                    'warning',
+                    15,
+                )
+
+        # Check 7: No institution identified at all in a diploma
+        if not institution and not any(kw in text_lower for kw in ['university', 'college', 'institute', 'academy', 'school']):
+            self._add_flag(
+                'No Institution Identified',
+                'Could not identify an educational institution. Legitimate diplomas prominently display the conferring institution.',
+                'warning',
+                15,
+            )
+
+        # Check 8: Common diploma-mill typos ("univercity", "colledge", "cume laude")
+        typos = [
+            ('univercity', 'university'),
+            ('universtiy', 'university'),
+            ('colledge', 'college'),
+            ('accademy', 'academy'),
+            ('cume laude', 'cum laude'),
+            ('magma cum laude', 'magna cum laude'),
+            ('summma', 'summa'),
+            ('curriculam', 'curriculum'),
+            ('diplomma', 'diploma'),
+        ]
+        for wrong, right in typos:
+            if wrong in text_lower:
+                self._add_flag(
+                    'Misspelling on Credential',
+                    f'Document contains "{wrong}" (correct spelling: "{right}"). Legitimate institutions do not misspell degree/institution nomenclature. Strong indicator of diploma-mill origin or fabrication.',
+                    'critical',
+                    40,
+                )
+                break
+
+        return result
+
+    def _validate_transcript(self, text: str, data: Dict) -> Dict:
+        """Validate an academic transcript."""
+        result = {'valid': True, 'checks': [], 'errors': []}
+        text_lower = text.lower()
+
+        # Check 1: Institution vs mills
+        institution = (data.get('institution') or '').lower()
+        if institution:
+            for mill in self.KNOWN_DIPLOMA_MILLS:
+                if mill in institution or (len(institution) > 5 and institution in mill):
+                    self._add_flag(
+                        'Known Diploma Mill (Transcript)',
+                        f'Transcript institution "{data.get("institution")}" matches a documented diploma mill.',
+                        'critical',
+                        50,
+                    )
+                    return result
+
+        # Check 2: Suspicious credential phrases
+        for phrase, score in self.SUSPICIOUS_EDUCATION_PHRASES:
+            if phrase in text_lower:
+                self._add_flag(
+                    'Suspicious Credential Language',
+                    f'Transcript contains phrase "{phrase}", associated with diploma mills.',
+                    'critical',
+                    score,
+                )
+                break
+
+        # Check 3: Accreditor mentioned
+        if data.get('accreditor_mentioned'):
+            self._add_flag(
+                f'Recognized Accreditor: {data["accreditor_mentioned"]}',
+                f'Transcript references {data["accreditor_mentioned"]}, a US Department of Education recognized accreditor.',
+                'info',
+                -15,
+            )
+            result['checks'].append(f'Accreditor: {data["accreditor_mentioned"]}')
+
+        # Check 4: GPA calculation vs stated cumulative GPA
+        courses = data.get('courses', [])
+        claimed_gpa = data.get('cumulative_gpa')
+        if courses and claimed_gpa is not None:
+            total_qp = 0.0
+            total_cr = 0.0
+            for c in courses:
+                gp = self.GRADE_POINT_MAP.get(c.get('grade', '').upper())
+                cr = c.get('credits', 0) or 0
+                if gp is not None and cr:
+                    total_qp += gp * cr
+                    total_cr += cr
+            if total_cr >= 3:  # need a meaningful sample
+                calc_gpa = total_qp / total_cr
+                delta = abs(calc_gpa - claimed_gpa)
+                if delta > 0.15:
+                    self._add_flag(
+                        'Transcript GPA Mismatch',
+                        f'Stated cumulative GPA ({claimed_gpa:.2f}) does not match GPA calculated from listed courses ({calc_gpa:.2f}, {int(total_cr)} credits, {delta:.2f} apart). '
+                        'This discrepancy suggests either fabricated grades, altered GPA, or a transcript covering only a subset of coursework.',
+                        'critical' if delta > 0.30 else 'warning',
+                        35 if delta > 0.30 else 20,
+                    )
+                else:
+                    result['checks'].append(f'GPA reconciles: stated {claimed_gpa:.2f} vs. calculated {calc_gpa:.2f}')
+
+        # Check 5: Total credits vs sum of course credits
+        total_credits = data.get('total_credits')
+        if courses and total_credits:
+            summed = sum(c.get('credits', 0) or 0 for c in courses)
+            gap = abs(summed - total_credits)
+            if gap > max(3, total_credits * 0.10):
+                self._add_flag(
+                    'Credit Total Mismatch',
+                    f'Stated total credits ({total_credits}) does not match sum of listed course credits ({summed:.1f}). Off by {gap:.1f}.',
+                    'warning',
+                    20,
+                )
+
+        # Check 6: Impossibly-large individual course credits
+        for c in courses:
+            credits = c.get('credits', 0) or 0
+            if credits > 8:
+                self._add_flag(
+                    'Unusual Credit Hours',
+                    f'Course "{c.get("code")} {c.get("name")}" shows {credits} credit hours. US courses typically range 1-5; anything above 6 is very unusual.',
+                    'info',
+                    8,
+                )
+                break
+
+        # Check 7: Statistically improbable all-A transcript
+        if courses and len(courses) >= 8:
+            all_top = sum(1 for c in courses if c.get('grade', '').upper() in ('A', 'A+'))
+            if all_top == len(courses):
+                self._add_flag(
+                    'All-Perfect Grades',
+                    f'All {len(courses)} listed courses show grade A/A+. Possible for exceptional students, but this pattern is very common on fabricated transcripts. Verify with registrar.',
+                    'info',
+                    10,
+                )
+
+        # Check 8: GPA out of 4.0 scale range
+        if claimed_gpa is not None and (claimed_gpa < 0 or claimed_gpa > 4.5):
+            self._add_flag(
+                'GPA Out of Range',
+                f'Stated GPA ({claimed_gpa}) is outside the typical US 4.0 scale (0.0-4.3). Verify grading scale before comparing.',
+                'warning',
+                15,
+            )
+
+        # Check 9: Diploma-mill spellings
+        typos = [('univercity', 'university'), ('colledge', 'college'),
+                 ('curriculam', 'curriculum'), ('transcrpit', 'transcript')]
+        for wrong, right in typos:
+            if wrong in text_lower:
+                self._add_flag(
+                    'Misspelling on Transcript',
+                    f'Transcript contains "{wrong}" (correct: "{right}"). Legitimate registrars do not misspell fundamental terms.',
+                    'critical',
+                    35,
+                )
+                break
+
+        result['checks'].append(f'{len(courses)} courses parsed from transcript')
+        return result
+
+    def _validate_certification(self, text: str, data: Dict) -> Dict:
+        """Validate a professional license or certification."""
+        result = {'valid': True, 'checks': [], 'errors': []}
+        text_lower = text.lower()
+
+        # Check 1: Recognized issuer
+        if data.get('issuer_recognized'):
+            self._add_flag(
+                f'Recognized Issuer: {data["issuer_recognized"]}',
+                f'Document references {data["issuer_recognized"]}, a recognized professional certification/licensing body. Positive legitimacy signal.',
+                'info',
+                -20,
+            )
+            result['checks'].append(f'Issuer: {data["issuer_recognized"]}')
+        else:
+            self._add_flag(
+                'Unrecognized Certification Issuer',
+                'Certificate does not reference a recognized professional issuing body. Verify the issuer exists and actually issues this credential (many fake certifications reference vague or invented "institutes" or "boards").',
+                'warning',
+                15,
+            )
+
+        # Check 2: License-number format sanity
+        lic = data.get('license_number', '')
+        if lic:
+            result['checks'].append(f'License #: {lic}')
+            if len(lic) <= 3:
+                self._add_flag(
+                    'Very Short License Number',
+                    f'License number "{lic}" is unusually short. Real professional licenses use longer identifiers.',
+                    'info',
+                    10,
+                )
+            # Look for placeholder patterns
+            if lic.upper() in ('12345', '00000', 'ABCDE', 'XXXXX') or re.match(r'^([A-Z0-9])\1{3,}$', lic):
+                self._add_flag(
+                    'Placeholder-Looking License Number',
+                    f'License number "{lic}" looks like a placeholder rather than a real credential ID.',
+                    'critical',
+                    35,
+                )
+
+        # Check 3: Expiration-date sanity
+        exp = data.get('expiration_date', '') or ''
+        if exp:
+            years = re.findall(r'\b(19\d{2}|20\d{2})\b', exp)
+            if years:
+                exp_year = int(years[0])
+                current_year = datetime.now().year
+                if exp_year < current_year - 5:
+                    self._add_flag(
+                        'Certification Long Expired',
+                        f'Certificate expiration ({exp_year}) is more than 5 years past. Verify candidate holds current credential if required for the role.',
+                        'warning',
+                        15,
+                    )
+                elif exp_year > current_year + 20:
+                    self._add_flag(
+                        'Implausibly Distant Expiration',
+                        f'Certificate expiration ({exp_year}) is unusually far in the future. Most professional credentials require renewal every 1-5 years.',
+                        'info',
+                        10,
+                    )
+
+        # Check 4: Suspicious credential phrases
+        for phrase, score in self.SUSPICIOUS_EDUCATION_PHRASES:
+            if phrase in text_lower:
+                self._add_flag(
+                    'Suspicious Credential Language',
+                    f'Document contains phrase "{phrase}", associated with fabricated credentials.',
+                    'critical',
+                    score,
+                )
+                break
+
+        # Check 5: Common cert-mill tells
+        cert_typos = [
+            ('certfied', 'certified'),
+            ('cerified', 'certified'),
+            ('proffesional', 'professional'),
+            ('licence', 'license'),  # British spelling — flag as info only
+        ]
+        for wrong, right in cert_typos:
+            if wrong in text_lower and wrong != 'licence':
+                self._add_flag(
+                    'Misspelling on Certificate',
+                    f'Certificate contains "{wrong}" (correct: "{right}"). Legitimate issuers do not misspell core credential terms.',
+                    'warning',
+                    20,
+                )
+                break
+
+        return result
+
     def _validate_pay_stub_math(self, text: str, data: Dict) -> Dict:
         """Comprehensive pay stub math validation."""
         result = {'valid': True, 'checks': [], 'errors': []}
@@ -2113,9 +2906,188 @@ Creation Date: {current_results.get('metadata', {}).get('creation_date', 'Unknow
 Current Risk Score: {self.risk_score}
 Flags Found So Far: {len(self.flags)}
 """
-            
-            # Comprehensive prompt for fraud detection
-            prompt = f"""You are an expert forensic document analyst specializing in employment verification fraud detection. Analyze this {doc_type} image for signs of fraud or manipulation.
+
+            # v2.5: Education documents get a different prompt — the W-2/box-numbering
+            # detection logic below is noise for a diploma or transcript.
+            education_types = ("Diploma", "Transcript", "Professional License/Certification", "Diploma/Transcript")
+            if doc_type in education_types:
+                prompt = self._build_education_ai_prompt(doc_type, context)
+            else:
+                prompt = self._build_employment_ai_prompt(doc_type, context)
+
+            response = self.ai_client.messages.create(
+                model="claude-sonnet-4-20250514",
+                max_tokens=1500,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": media_type,
+                                    "data": img_data,
+                                },
+                            },
+                            {
+                                "type": "text",
+                                "text": prompt,
+                            },
+                        ],
+                    }
+                ],
+            )
+
+            # Parse the response
+            response_text = response.content[0].text
+
+            # Try to extract JSON from response
+            json_match = re.search(r'\{[\s\S]*\}', response_text)
+            if json_match:
+                try:
+                    ai_result = json.loads(json_match.group())
+
+                    # Common: overall assessment flag
+                    assessment = ai_result.get('overall_assessment', '')
+                    confidence = ai_result.get('confidence', 50)
+                    if assessment == 'LIKELY_FRAUDULENT':
+                        self._add_flag(
+                            'AI Analysis: Likely Fraudulent',
+                            f"AI detected significant fraud indicators with {confidence}% confidence. Key findings: {', '.join(ai_result.get('key_findings', [])[:3])}",
+                            'critical',
+                            35,
+                        )
+                    elif assessment == 'SUSPICIOUS':
+                        self._add_flag(
+                            'AI Analysis: Suspicious Elements',
+                            f"AI identified suspicious elements ({confidence}% confidence). Review recommended: {ai_result.get('recommendation', 'Manual review advised')}",
+                            'warning',
+                            20,
+                        )
+                    else:
+                        self._add_flag(
+                            'AI Analysis: Appears Legitimate',
+                            f"AI analysis found no significant fraud indicators ({confidence}% confidence).",
+                            'info',
+                            -10,
+                        )
+
+                    if doc_type in education_types:
+                        self._apply_education_ai_flags(ai_result)
+                    else:
+                        self._apply_employment_ai_flags(ai_result, doc_type)
+
+                    return {
+                        'available': True,
+                        'result': ai_result,
+                        'raw_response': response_text,
+                    }
+                except json.JSONDecodeError:
+                    pass
+
+            # If JSON parsing failed, return raw response
+            return {
+                'available': True,
+                'result': {'raw_analysis': response_text},
+                'parsing_note': 'Could not parse structured response',
+            }
+
+        except Exception as e:
+            return {
+                'available': False,
+                'error': str(e),
+            }
+
+    def _build_education_ai_prompt(self, doc_type: str, context: str) -> str:
+        """Build AI vision prompt for education documents (diploma / transcript / cert)."""
+        return f"""You are an expert forensic document analyst specializing in academic and professional credential fraud. Analyze this {doc_type} image for signs of fabrication, alteration, or diploma-mill origin.
+
+CONTEXT:
+{context}
+
+ANALYZE FOR:
+
+1. **Institution / Issuer Authenticity** (CRITICAL)
+   - Is the institution or issuing body name spelled correctly and consistent with a real, accredited entity?
+   - Common diploma-mill tells: misspellings ("univercity", "colledge", "accademy"), bad Latin ("cume laude", "summma", "curriculam"), or invented-sounding names that mimic real institutions with slight variations.
+   - Does the institution use accepted US higher-ed nomenclature (University, College, Institute of Technology, State University)?
+   - For professional certs: is the issuer a recognized body (AICPA, PMI, ISACA, state licensing board, medical specialty board, bar association)?
+
+2. **Diploma Visual Design** (For Diplomas)
+   - Does the design follow professional academic diploma conventions: formal serif fonts, Latin phrases, embossed or printed seal, signatures of president/registrar/dean?
+   - Are signatures present in expected positions with legible titles?
+   - Is the institutional seal visible? Does it look embossed/printed professionally, or copied/pasted from a low-resolution graphic?
+   - Are Latin honors (cum laude, magna cum laude, summa cum laude) spelled correctly if present?
+
+3. **Transcript Structure** (For Transcripts)
+   - Are course codes formatted consistently (e.g., ENGL 101, MATH 240)?
+   - Are terms/semesters listed chronologically with reasonable course loads (typically 12-18 credits per full-time semester)?
+   - Are grades in a consistent format (letter A-F or numerical, not randomly mixed)?
+   - Is the grading scale defined on the document?
+   - Are credit hours per course reasonable (typically 1-5 for US institutions)?
+   - Does the stated GPA appear consistent with the courses listed (rough sanity check by eye)?
+
+4. **Professional Certification Specifics**
+   - Is the credential number formatted consistently with the issuer’s known convention?
+   - Are issue and expiration dates present and plausible?
+   - Does the credential title match a real product offered by the issuer, or does it look invented?
+
+5. **Diploma-Mill Red Flags** (CRITICAL)
+   - Language like "life experience degree", "no attendance required", "based on prior learning only", "degree in one day", "instant PhD"
+   - Vague accreditation claims ("internationally accredited", "US recognized") without naming a specific US Department of Education recognized accreditor
+   - PO Box or virtual office addresses instead of a physical campus
+   - Institution names that mimic real universities with small variations
+   - Missing or unclear signatories / titles
+   - Overall appearance that resembles a Microsoft Word template rather than professionally printed academic paper
+
+6. **Alteration Signs** (CRITICAL)
+   - Name, degree, grade, GPA, or date text that differs in font, weight, alignment, or darkness from surrounding text (indicates a real transcript/diploma was altered)
+   - Areas that appear digitally sharpened or blurred inconsistently
+   - White or colored rectangles covering original content
+   - Copy/paste edges around names, dates, degrees, or grades
+   - Signature that looks scanned or clipped from another document
+
+7. **Overall Design Quality**
+   - Real credentials: professional printing, quality paper texture, formal design, often embossed elements, correct Latin
+   - Diploma mills: Word-template feel, generic borders, printer artifacts, misaligned elements, poor Latin, low-res seals
+
+RESPOND IN THIS JSON FORMAT:
+{{
+    "overall_assessment": "LIKELY_LEGITIMATE" | "SUSPICIOUS" | "LIKELY_FRAUDULENT",
+    "confidence": 0-100,
+    "institution_authenticity": {{
+        "institution_name_detected": "name as visible on document",
+        "appears_legitimate": true/false,
+        "spelling_issues": ["list any misspellings in institution name, Latin phrases, or credential names"],
+        "concerns": ["specific concerns about the institution or issuer"]
+    }},
+    "visual_design_quality": {{
+        "score": 0-100,
+        "appears_professionally_printed": true/false,
+        "seal_present_and_authentic": true/false,
+        "signatures_present": true/false,
+        "concerns": ["visual design concerns"]
+    }},
+    "content_consistency": {{
+        "internally_consistent": true/false,
+        "issues": ["e.g., grades don't match stated GPA, credit total mismatch, term ordering issues"]
+    }},
+    "diploma_mill_indicators": {{
+        "detected": true/false,
+        "indicators": ["specific mill red flags found"]
+    }},
+    "alteration_signs": {{
+        "detected": true/false,
+        "indicators": ["specific alteration evidence: font differences on names/grades, cut-paste artifacts, covered text"]
+    }},
+    "key_findings": ["most important findings, max 5"],
+    "recommendation": "brief recommendation for the verifier"
+}}"""
+
+    def _build_employment_ai_prompt(self, doc_type: str, context: str) -> str:
+        """Build AI vision prompt for employment / tax documents (existing behavior)."""
+        return f"""You are an expert forensic document analyst specializing in employment verification fraud detection. Analyze this {doc_type} image for signs of fraud or manipulation.
 
 CONTEXT:
 {context}
@@ -2280,203 +3252,194 @@ RESPOND IN THIS JSON FORMAT:
     "recommendation": "brief recommendation for the reviewer"
 }}"""
 
-            response = self.ai_client.messages.create(
-                model="claude-sonnet-4-20250514",
-                max_tokens=1500,
-                messages=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "image",
-                                "source": {
-                                    "type": "base64",
-                                    "media_type": media_type,
-                                    "data": img_data,
-                                },
-                            },
-                            {
-                                "type": "text",
-                                "text": prompt
-                            }
-                        ],
-                    }
-                ],
+    def _apply_education_ai_flags(self, ai_result: Dict) -> None:
+        """Turn education-doc AI JSON into fraud flags."""
+        # 1) Institution authenticity
+        inst = ai_result.get('institution_authenticity', {})
+        if inst.get('appears_legitimate') is False:
+            self._add_flag(
+                'Institution Authenticity Concern',
+                f"AI could not confirm the institution as legitimate. "
+                f"{', '.join(inst.get('concerns', [])[:2]) or 'See visual analysis for detail.'}",
+                'warning',
+                25,
             )
-            
-            # Parse the response
-            response_text = response.content[0].text
-            
-            # Try to extract JSON from response
-            json_match = re.search(r'\{[\s\S]*\}', response_text)
-            if json_match:
-                try:
-                    ai_result = json.loads(json_match.group())
-                    
-                    # Add flags based on AI findings
-                    assessment = ai_result.get('overall_assessment', '')
-                    confidence = ai_result.get('confidence', 50)
-                    
-                    if assessment == 'LIKELY_FRAUDULENT':
-                        self._add_flag(
-                            'AI Analysis: Likely Fraudulent',
-                            f"AI detected significant fraud indicators with {confidence}% confidence. Key findings: {', '.join(ai_result.get('key_findings', [])[:3])}",
-                            'critical',
-                            35
-                        )
-                    elif assessment == 'SUSPICIOUS':
-                        self._add_flag(
-                            'AI Analysis: Suspicious Elements',
-                            f"AI identified suspicious elements ({confidence}% confidence). Review recommended: {ai_result.get('recommendation', 'Manual review advised')}",
-                            'warning',
-                            20
-                        )
-                    else:
-                        self._add_flag(
-                            'AI Analysis: Appears Legitimate',
-                            f"AI analysis found no significant fraud indicators ({confidence}% confidence).",
-                            'info',
-                            -10
-                        )
-                    
-                    # Add font consistency flags - only when corroborated by other indicators
-                    # (per Trish Gustin feedback June 2026: scanning/photocopying naturally
-                    # produces font variation; flag only when other fraud signals support it)
-                    font_check = ai_result.get('font_consistency', {})
-                    if font_check.get('consistent') == False:
-                        font_issues = font_check.get('issues', [])
-                        corroborating = font_check.get('corroborating_indicators', [])
-                        # Only flag if AI provided corroborating indicators
-                        if corroborating and font_issues:
-                            for issue in font_issues[:3]:
-                                self._add_flag(
-                                    'Font Mismatch with Corroborating Indicators',
-                                    f"{issue} (supported by: {', '.join(corroborating[:2])})",
-                                    'warning',
-                                    10
-                                )
-                    
-                    # Add date/year tampering flags
-                    date_check = ai_result.get('date_year_tampering', {})
-                    if date_check.get('detected'):
-                        date_issues = date_check.get('issues', [])
-                        for issue in date_issues[:2]:
-                            self._add_flag(
-                                'Date/Year Tampering Detected',
-                                issue,
-                                'critical',
-                                35
-                            )
-                    
-                    # Check W-2/1099 year styling (should be larger/bolder)
-                    if doc_type in ['W-2', '1099'] and date_check.get('year_styling_correct') == False:
-                        year_notes = date_check.get('year_styling_notes', 'Tax year does not appear in larger/bolder font as expected on official IRS forms.')
-                        self._add_flag(
-                            'Tax Year Styling Incorrect',
-                            f'{year_notes} On official W-2 and 1099 forms, the tax year is displayed larger and bolder than other text. '
-                            'This discrepancy may indicate a template or fabricated document.',
-                            'warning',
-                            20
-                        )
-                    
-                    # Add invalid field value flags from AI
-                    invalid_check = ai_result.get('invalid_field_values', {})
-                    if invalid_check.get('detected'):
-                        invalid_issues = invalid_check.get('issues', [])
-                        for issue in invalid_issues[:2]:
-                            self._add_flag(
-                                'Invalid Field Value (AI)',
-                                issue,
-                                'critical',
-                                30
-                            )
-                    
-                    # Add manipulation indicator flags
-                    if ai_result.get('manipulation_indicators', {}).get('detected'):
-                        indicators = ai_result['manipulation_indicators'].get('indicators', [])
-                        for indicator in indicators[:2]:
-                            self._add_flag(
-                                'AI Detected Manipulation',
-                                indicator,
-                                'critical',
-                                15
-                            )
-                    
-                    # Add box numbering / structural flags (NEW v2.3 - Myssy's request)
-                    # Catches things like three "13" boxes without a/b/c suffixes,
-                    # which a legitimate W-2 would never have.
-                    box_check = ai_result.get('box_numbering_structure', {})
-                    if box_check.get('valid') == False:
-                        box_issues = box_check.get('issues', [])
-                        for issue in box_issues[:3]:
-                            self._add_flag(
-                                'Invalid Box Numbering / Structure',
-                                f'{issue} Official IRS forms have a strict box layout; deviations strongly suggest fabrication or template editing.',
-                                'critical',
-                                35
-                            )
-                    
-                    # Add overlapping text / collision flags (NEW v2.3 - Myssy's request)
-                    # Genuine system-generated W-2s do not have words colliding with
-                    # checkboxes or other field elements.
-                    overlap_check = ai_result.get('overlapping_text', {})
-                    if overlap_check.get('detected'):
-                        overlap_issues = overlap_check.get('issues', [])
-                        for issue in overlap_issues[:3]:
-                            self._add_flag(
-                                'Overlapping Text Detected',
-                                f'{issue} Text overlapping form fields or checkboxes is rare on system-generated documents and suggests manual editing or template assembly.',
-                                'warning',
-                                20
-                            )
-                    
-                    # Lines crossing through text (NEW v2.4 - Myssy's St. Luke's W-2 feedback)
-                    # Perforation/form lines should NEVER cut through characters on a
-                    # real system-generated W-2.
-                    lines_check = ai_result.get('lines_crossing_text', {})
-                    if lines_check.get('detected'):
-                        for issue in lines_check.get('issues', [])[:3]:
-                            self._add_flag(
-                                'Form Line Crosses Through Text',
-                                f'{issue} Form lines or perforation marks cutting through characters strongly suggest the text was overlaid on top of the form image rather than rendered by a payroll system.',
-                                'critical',
-                                30
-                            )
-                    
-                    # Inconsistent / missing box borders (NEW v2.4)
-                    # Genuine W-2s have uniform borders across all boxes in a row.
-                    border_check = ai_result.get('box_border_anomalies', {})
-                    if border_check.get('detected'):
-                        for issue in border_check.get('issues', [])[:3]:
-                            self._add_flag(
-                                'Inconsistent Box Borders',
-                                f'{issue} Genuine W-2s have uniform border weight across boxes in the same row; missing or lighter borders suggest the box was rebuilt or edited.',
-                                'warning',
-                                20
-                            )
-                    
-                    return {
-                        'available': True,
-                        'result': ai_result,
-                        'raw_response': response_text
-                    }
-                    
-                except json.JSONDecodeError:
-                    pass
-            
-            # If JSON parsing failed, return raw response
-            return {
-                'available': True,
-                'result': {'raw_analysis': response_text},
-                'parsing_note': 'Could not parse structured response'
-            }
-            
-        except Exception as e:
-            return {
-                'available': False,
-                'error': str(e)
-            }
-    
+        for issue in inst.get('spelling_issues', [])[:2]:
+            self._add_flag(
+                'Spelling / Latin Anomaly',
+                f'{issue}. Legitimate institutions do not misspell their own names, Latin honors, or degree terminology.',
+                'critical',
+                30,
+            )
+
+        # 2) Visual design quality
+        design = ai_result.get('visual_design_quality', {})
+        if design.get('appears_professionally_printed') is False:
+            self._add_flag(
+                'Non-Professional Print Quality',
+                'AI assesses this document as looking more like a Word template or amateur print than a professionally printed academic credential.',
+                'warning',
+                20,
+            )
+        if design.get('seal_present_and_authentic') is False:
+            self._add_flag(
+                'Missing / Suspect Institutional Seal',
+                'The expected institutional seal is missing, low-resolution, or looks copied/pasted rather than embossed or professionally printed.',
+                'warning',
+                15,
+            )
+        if design.get('signatures_present') is False:
+            self._add_flag(
+                'Missing Signatures',
+                'Expected signatures (registrar, president, dean) are missing. Real diplomas display these signatories.',
+                'warning',
+                15,
+            )
+        for concern in design.get('concerns', [])[:2]:
+            self._add_flag('Visual Design Concern', concern, 'info', 5)
+
+        # 3) Content consistency (GPA/credits/term ordering)
+        cc = ai_result.get('content_consistency', {})
+        if cc.get('internally_consistent') is False:
+            for issue in cc.get('issues', [])[:3]:
+                self._add_flag(
+                    'Credential Content Inconsistency',
+                    issue,
+                    'warning',
+                    20,
+                )
+
+        # 4) Diploma mill indicators
+        mill = ai_result.get('diploma_mill_indicators', {})
+        if mill.get('detected'):
+            for indicator in mill.get('indicators', [])[:3]:
+                self._add_flag(
+                    'Diploma Mill Indicator (AI)',
+                    indicator,
+                    'critical',
+                    35,
+                )
+
+        # 5) Alteration signs (name/grade/date edits on a real credential)
+        alt = ai_result.get('alteration_signs', {})
+        if alt.get('detected'):
+            for indicator in alt.get('indicators', [])[:3]:
+                self._add_flag(
+                    'Credential Alteration Sign',
+                    indicator,
+                    'critical',
+                    30,
+                )
+
+    def _apply_employment_ai_flags(self, ai_result: Dict, doc_type: str) -> None:
+        """Turn employment / tax-document AI JSON into fraud flags."""
+        # Font consistency - only flag when AI provided corroborating indicators.
+        # (Per Trish Gustin feedback June 2026: scanning/photocopying naturally
+        # produces font variation; flag only when other fraud signals support it.)
+        font_check = ai_result.get('font_consistency', {})
+        if font_check.get('consistent') is False:
+            font_issues = font_check.get('issues', [])
+            corroborating = font_check.get('corroborating_indicators', [])
+            if corroborating and font_issues:
+                for issue in font_issues[:3]:
+                    self._add_flag(
+                        'Font Mismatch with Corroborating Indicators',
+                        f"{issue} (supported by: {', '.join(corroborating[:2])})",
+                        'warning',
+                        10,
+                    )
+
+        # Date / year tampering
+        date_check = ai_result.get('date_year_tampering', {})
+        if date_check.get('detected'):
+            for issue in date_check.get('issues', [])[:2]:
+                self._add_flag(
+                    'Date/Year Tampering Detected',
+                    issue,
+                    'critical',
+                    35,
+                )
+
+        # Tax-year styling (W-2 / 1099 specific)
+        if doc_type in ('W-2', '1099') and date_check.get('year_styling_correct') is False:
+            year_notes = date_check.get(
+                'year_styling_notes',
+                'Tax year does not appear in larger/bolder font as expected on official IRS forms.',
+            )
+            self._add_flag(
+                'Tax Year Styling Incorrect',
+                f'{year_notes} On official W-2 and 1099 forms, the tax year is displayed larger and bolder than other text. '
+                'This discrepancy may indicate a template or fabricated document.',
+                'warning',
+                20,
+            )
+
+        # Invalid field values (N/A in numeric fields, etc.)
+        invalid_check = ai_result.get('invalid_field_values', {})
+        if invalid_check.get('detected'):
+            for issue in invalid_check.get('issues', [])[:2]:
+                self._add_flag(
+                    'Invalid Field Value (AI)',
+                    issue,
+                    'critical',
+                    30,
+                )
+
+        # Manipulation indicators (blur, cut lines, covered text)
+        mi = ai_result.get('manipulation_indicators', {})
+        if mi.get('detected'):
+            for indicator in mi.get('indicators', [])[:2]:
+                self._add_flag(
+                    'AI Detected Manipulation',
+                    indicator,
+                    'critical',
+                    15,
+                )
+
+        # Box numbering / structural (v2.3)
+        box_check = ai_result.get('box_numbering_structure', {})
+        if box_check.get('valid') is False:
+            for issue in box_check.get('issues', [])[:3]:
+                self._add_flag(
+                    'Invalid Box Numbering / Structure',
+                    f'{issue} Official IRS forms have a strict box layout; deviations strongly suggest fabrication or template editing.',
+                    'critical',
+                    35,
+                )
+
+        # Overlapping text / collisions with checkboxes (v2.3)
+        overlap_check = ai_result.get('overlapping_text', {})
+        if overlap_check.get('detected'):
+            for issue in overlap_check.get('issues', [])[:3]:
+                self._add_flag(
+                    'Overlapping Text Detected',
+                    f'{issue} Text overlapping form fields or checkboxes is rare on system-generated documents and suggests manual editing or template assembly.',
+                    'warning',
+                    20,
+                )
+
+        # Lines crossing through text (v2.4)
+        lines_check = ai_result.get('lines_crossing_text', {})
+        if lines_check.get('detected'):
+            for issue in lines_check.get('issues', [])[:3]:
+                self._add_flag(
+                    'Form Line Crosses Through Text',
+                    f'{issue} Form lines or perforation marks cutting through characters strongly suggest the text was overlaid on top of the form image rather than rendered by a payroll system.',
+                    'critical',
+                    30,
+                )
+
+        # Inconsistent / missing box borders (v2.4)
+        border_check = ai_result.get('box_border_anomalies', {})
+        if border_check.get('detected'):
+            for issue in border_check.get('issues', [])[:3]:
+                self._add_flag(
+                    'Inconsistent Box Borders',
+                    f'{issue} Genuine W-2s have uniform border weight across boxes in the same row; missing or lighter borders suggest the box was rebuilt or edited.',
+                    'warning',
+                    20,
+                )
+
     def _generate_recommendations(self, results: Dict) -> List[str]:
         """Generate actionable recommendations based on analysis."""
         recommendations = []
@@ -2507,8 +3470,24 @@ RESPOND IN THIS JSON FORMAT:
                 recommendations.append("🧮 Mathematical errors found - likely fabricated document")
             if 'Created Today' in flag['title']:
                 recommendations.append("📅 Document created very recently - verify pay period dates match")
-        
-        return recommendations[:5]  # Max 5 recommendations
+            # Education-specific recommendations (v2.5)
+            if 'Diploma Mill' in flag['title']:
+                recommendations.append("🎓 Diploma mill detected - degree is not recognized. Verify candidate holds a credential from an accredited institution.")
+            if 'GPA Mismatch' in flag['title']:
+                recommendations.append("📊 Transcript GPA does not reconcile with listed courses - request an official transcript directly from the registrar")
+            if 'Spelling' in flag['title'] and 'Latin' in flag.get('title', ''):
+                recommendations.append("🔤 Institution or Latin honor misspelled - request verification through National Student Clearinghouse or the registrar")
+            if 'Institution Authenticity' in flag['title'] or 'Unrecognized Certification Issuer' in flag['title']:
+                recommendations.append("🏫 Institution/issuer not confirmed - verify existence and accreditation via US Dept of Education database (nces.ed.gov)")
+
+        # Deduplicate while preserving order
+        seen = set()
+        deduped = []
+        for r in recommendations:
+            if r not in seen:
+                seen.add(r)
+                deduped.append(r)
+        return deduped[:5]  # Max 5 recommendations
     
     def _add_flag(self, title: str, description: str, severity: str, score_impact: int):
         """Add a fraud indicator flag."""

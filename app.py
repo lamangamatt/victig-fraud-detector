@@ -108,14 +108,18 @@ with st.sidebar:
     
     st.header("📋 Document Types")
     st.markdown("""
-    **Supported:**
+    **Employment / Income:**
     - ✅ Pay Stubs
     - ✅ W-2 Forms
     - ✅ 1099 Forms
     - ✅ IRS Wage & Income Transcripts (batch)
     - ✅ Offer Letters
-    - ✅ Diplomas/Transcripts
-    
+
+    **Education / Credentials:**
+    - 🎓 Diplomas / Degree Certificates
+    - 📊 Academic Transcripts
+    - 📜 Professional Licenses / Certifications
+
     **Formats:** PDF, PNG, JPG
     """)
     
@@ -279,13 +283,18 @@ with col1:
             "1099",
             "IRS Transcript",
             "Offer Letter",
-            "Diploma/Transcript",
+            "Diploma",
+            "Transcript",
+            "Professional License/Certification",
             "Other",
         ],
         help=(
             "Select the type of document for specialized analysis. "
             "'IRS Transcript' supports batch upload so we can catch "
-            "duplicate tracking numbers across pages."
+            "duplicate tracking numbers across pages. "
+            "Diploma / Transcript / Certification each use a dedicated "
+            "education-fraud validator (diploma mill lookup, GPA math, "
+            "issuer recognition, etc.)."
         ),
     )
 with col2:
