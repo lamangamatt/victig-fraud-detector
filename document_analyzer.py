@@ -2699,6 +2699,26 @@ class DocumentAnalyzer:
                 image = image.convert('RGB')
             
             img_array = np.array(image)
+
+            # 2026-08-10 (Myssy false-positive fix): Detect physical marker /
+            # ink redactions BEFORE the darkness-distribution checks. Marker
+            # ink sits at luma ~0-30, printed text at luma ~40-100 - that's
+            # the exact bimodal signature the tool watches for as a fraud
+            # indicator. When the darkness split is caused by legitimate
+            # post-hoc marker redactions (not template overlay), those
+            # checks fire as false positives. Setting redactions_detected
+            # here gates the darkness checks below.
+            if not self.redactions_detected and self._detect_visual_redactions(image):
+                self.redactions_detected = True
+                self._add_flag(
+                    'Physical Redactions Detected',
+                    'Document contains heavy black marker or ink redactions covering '
+                    'sensitive information. This is legitimate when candidates redact '
+                    'SSN, wages, or other PII on paper before scanning/photographing.',
+                    'info',
+                    -5
+                )
+                results['physical_redactions_detected'] = True
             
             # Check 1: Aspect ratio
             width, height = image.size
@@ -2807,14 +2827,25 @@ class DocumentAnalyzer:
                 # medium payroll data.  When the producer is a known payroll
                 # system, downgrade darkness flags to "info" or suppress entirely.
                 legit_producer = self._has_legitimate_producer()
+                # 2026-08-10 (Myssy false-positive fix): marker redactions on
+                # a photo/scan of a paper document produce the same darkness
+                # bimodality as "template overlay" fraud. When we've already
+                # detected physical redactions, treat these darkness signals
+                # the same way we treat pre-printed IRS forms - benign.
+                suppress_darkness = legit_producer or self.redactions_detected
+                suppression_reason = (
+                    'a pre-printed IRS form overprinted with payroll data'
+                    if legit_producer else
+                    'heavy marker/ink redactions on the document'
+                )
                 if text_std > 55:
-                    if legit_producer:
-                        # Expected for pre-printed IRS forms + payroll overprint
+                    if suppress_darkness:
+                        # Expected for pre-printed IRS forms + payroll overprint,
+                        # or for paper documents with post-hoc marker redactions.
                         self._add_flag(
-                            'Expected Text Darkness Variance (Pre-Printed Form)',
-                            f'Text darkness variance (std dev: {text_std:.1f}) is consistent with a '
-                            f'pre-printed IRS form overprinted with payroll data — expected for output '
-                            f'from a known payroll system.',
+                            'Expected Text Darkness Variance',
+                            f'Text darkness variance (std dev: {text_std:.1f}) is consistent with '
+                            f'{suppression_reason}. Not treating as a fraud signal.',
                             'info',
                             0
                         )
@@ -2828,8 +2859,8 @@ class DocumentAnalyzer:
                         )
                         results['anomalies'].append('Multiple ink densities detected')
                 elif text_std > 50:
-                    if legit_producer:
-                        pass  # not worth noting at this level for legit sources
+                    if suppress_darkness:
+                        pass  # not worth noting at this level when we already know why
                     else:
                         # Borderline - note but don't heavily penalize
                         self._add_flag(
@@ -2852,9 +2883,9 @@ class DocumentAnalyzer:
                     if len(dark_text) > 100 and len(medium_text) > 100:
                         dark_ratio = len(medium_text) / len(dark_text)
                         if 0.3 < dark_ratio < 4:  # Both groups are substantial
-                            if legit_producer:
-                                # Known payroll systems print onto pre-printed IRS forms,
-                                # which is exactly what a bimodal distribution looks like.
+                            if suppress_darkness:
+                                # Legit producers overprint onto pre-printed forms, and
+                                # marker redactions produce the same bimodal signature.
                                 # Not evidence of tampering.
                                 pass
                             else:
