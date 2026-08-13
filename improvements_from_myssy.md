@@ -1,4 +1,45 @@
 # VICTIG Fraud Detector Improvements
+
+## 2026-08-13 — Blue-ink 1099-NEC Miss (issue #1)
+
+**Reporter:** Myssy Clayson (VICTIG Verifications).
+**Sample:** Cropped 1099-NEC (Copy B, tax year 2025) with all
+payer/recipient fields typeset in blue instead of black. Image was
+743×274, aspect 2.71.
+**Before:** Scored LOW 25/100 (Metadata Missing info+10, Unusual
+Document Dimensions info+5, Low Resolution warning+10).
+**After:** Scores HIGH 70/100.
+
+Three changes landed in `document_analyzer.py`:
+
+1. **New `_check_text_color_channel(img_array, results)`** — warning +25.
+   Isolates dark text pixels (luma 20–130), excludes near-gray, computes
+   colored-text ratio and mean RGB. If ≥5% of text pixels are colored
+   *and* a single hue dominates (blue/red/green channel dominates by
+   ≥25 points), fires `Non-Black Machine Text`. Rationale: legit tax
+   documents print in black; colored typeset fields are a template-
+   overlay tell (data typed into a form template rather than exported
+   from real payer software).
+
+2. **New `Cropped or Truncated Image` check** in
+   `_analyze_visual_forensics` — warning +20. Aspect ratio outside
+   0.4–2.0 (Myssy's sample was 2.71) is far outside any real document
+   format and indicates intentional obscuration. Sits alongside the
+   pre-existing `Unusual Document Dimensions` info flag rather than
+   replacing it.
+
+3. **New `_compound_info_flags()` post-processing pass** — warning +15.
+   Called at the end of `analyze()` for every doc type. When ≥3 info-
+   level flags fire on the same document, adds a
+   `Multiple Anomalies Detected` warning. Backstops future "death by a
+   thousand info flags" cases that individually look benign.
+
+Regression test: `test_myssy_2026_08_13.py` (blue-ink 1099 stays
+HIGH ≥ 35, both new warning flags fire at warning severity). All
+prior Myssy regression tests still pass unchanged.
+
+---
+
 ## Based on Myssy Clayson's High-Risk Document Samples (April 2026)
 
 ### Summary

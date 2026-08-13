@@ -515,6 +515,12 @@ class DocumentAnalyzer:
         if results.get('doc_type') == 'W-2':
             self._upgrade_metadata_flag_if_content_flagged()
 
+        # Post-processing (2026-08-13, Myssy Clayson improvement): compound
+        # multiple info-level signals into a warning. Prevents pattern
+        # documents from sneaking through as LOW when each hit was
+        # individually weighted charitably. Applies to all doc types.
+        self._compound_info_flags()
+
         # Compile results
         results['flags'] = self.flags
         results['risk_score'] = max(0, min(self.risk_score, 100))
@@ -1709,6 +1715,131 @@ class DocumentAnalyzer:
             15
         )
 
+    def _check_text_color_channel(self, img_array, results: Dict) -> None:
+        """Flag typeset (machine) text that renders in non-black ink.
+
+        Legit tax documents print in black. Blue/red/green machine-text
+        fields are a template-overlay tell — fields typed into a form
+        template rather than exported from real payer software.
+
+        Added 2026-08-13 based on Myssy Clayson feedback: a cropped
+        1099-NEC with payer/recipient fields all in blue typeset scored
+        LOW because no text-color check existed.
+        """
+        try:
+            # img_array is HxWx3 RGB. Compute luminance to isolate dark
+            # pixels (text) from the light background.
+            r = img_array[:, :, 0].astype(float)
+            g = img_array[:, :, 1].astype(float)
+            b = img_array[:, :, 2].astype(float)
+
+            # Rec. 601 luminance
+            luma = 0.299 * r + 0.587 * g + 0.114 * b
+
+            # Text mask: dark pixels but not pure black (excludes marker
+            # redactions and shadow artifacts). We want to sample only
+            # printed text.
+            text_mask = (luma > 20) & (luma < 130)
+            total_text = int(text_mask.sum())
+            if total_text < 500:
+                # Too few text pixels — likely a blank/whitespace-heavy
+                # image; skip to avoid false positives.
+                return
+
+            # Exclude near-gray pixels (real black ink prints as neutral
+            # gray under scan compression). We only care about coloured text.
+            channel_max = np.maximum(np.maximum(r, g), b)
+            channel_min = np.minimum(np.minimum(r, g), b)
+            saturation = channel_max - channel_min  # simple RGB spread
+            colored_text_mask = text_mask & (saturation > 25)
+
+            colored_count = int(colored_text_mask.sum())
+            colored_ratio = colored_count / total_text
+            results['colored_text_ratio'] = round(colored_ratio, 3)
+
+            # If a meaningful share of text pixels are colored (not just
+            # a stray logo watermark), inspect the dominant hue. Threshold
+            # chosen at 5% because on a real 1099-NEC only field values
+            # (not pre-printed form labels) render in the anomalous color,
+            # so even a fully-tampered form typically shows 5–15%
+            # colored-text pixels. Myssy's blue-text sample was 9%.
+            if colored_ratio < 0.05:
+                return
+
+            # Compute mean RGB of the colored text pixels to identify the
+            # dominant hue.
+            mean_r = float(r[colored_text_mask].mean())
+            mean_g = float(g[colored_text_mask].mean())
+            mean_b = float(b[colored_text_mask].mean())
+            results['colored_text_rgb'] = (
+                round(mean_r, 1),
+                round(mean_g, 1),
+                round(mean_b, 1),
+            )
+
+            # Classify the dominant channel. Thresholds chosen so that
+            # subtly-tinted scans (paper aging, JPEG chroma noise) don't
+            # trigger — only clearly non-black machine text should hit.
+            if mean_b > mean_r + 25 and mean_b > mean_g + 15:
+                hue = 'blue'
+            elif mean_r > mean_g + 25 and mean_r > mean_b + 25:
+                hue = 'red'
+            elif mean_g > mean_r + 25 and mean_g > mean_b + 25:
+                hue = 'green'
+            else:
+                # Colored pixels but no dominant hue — could be a
+                # multi-color logo; not conclusive of tampering.
+                return
+
+            self._add_flag(
+                'Non-Black Machine Text',
+                f'{colored_ratio*100:.0f}% of machine text renders in {hue} '
+                f'(mean RGB {int(mean_r)}, {int(mean_g)}, {int(mean_b)}) '
+                f'instead of black. Legitimate tax documents print in '
+                f'black; colored typeset fields suggest a template-overlay '
+                f'pattern where data was typed into a form template '
+                f'rather than exported from real payer software.',
+                'warning',
+                25
+            )
+        except Exception:
+            # Never let a visual heuristic break the analyzer.
+            pass
+
+    def _compound_info_flags(self):
+        """Aggregate low-severity signals into a single warning.
+
+        Individual 'info' flags often look benign in isolation but a
+        document with 3+ minor anomalies is more likely to be tampered
+        than one with zero. Add a single 'Multiple Anomalies Detected'
+        warning to prevent pattern documents from sneaking through as
+        LOW because each hit was weighted charitably.
+
+        Added 2026-08-13 based on Myssy Clayson feedback (cropped
+        blue-text 1099-NEC scored LOW because each miss was
+        individually 'info').
+        """
+        info_flags = [
+            f for f in self.flags
+            if f.get('severity') == 'info' and f.get('score_impact', 0) >= 0
+        ]
+        # Safety in case of double-invocation
+        already_added = any(
+            f.get('title') == 'Multiple Anomalies Detected'
+            for f in self.flags
+        )
+        if len(info_flags) >= 3 and not already_added:
+            titles = [f.get('title', '') for f in info_flags]
+            self._add_flag(
+                'Multiple Anomalies Detected',
+                f'{len(info_flags)} informational anomalies fired on the '
+                f'same document ({", ".join(titles)}). Individually each '
+                f'is minor, but the combination is unusual for a '
+                f'legitimate document.',
+                'warning',
+                15
+            )
+
     def _upgrade_metadata_flag_if_content_flagged(self):
         """After all checks: if a W-2 has content-level critical/warning flags,
         upgrade any 'Metadata Missing' flag from info to warning so it keeps its
@@ -2744,7 +2875,33 @@ class DocumentAnalyzer:
                     'warning',
                     10
                 )
-            
+
+            # Check 2b (NEW 2026-08-13, Myssy Clayson): Cropped image detection.
+            # Aspect ratios well outside any real document format (0.4–2.0)
+            # indicate a heavy crop that likely hides part of the form.
+            # A cropped 1099-NEC with aspect 2.71 previously scored LOW
+            # because "Unusual Document Dimensions" was only info +5; that
+            # severity did not reflect the risk of an intentionally-truncated
+            # tax document.
+            if aspect > 2.0 or aspect < 0.4:
+                self._add_flag(
+                    'Cropped or Truncated Image',
+                    f'Aspect ratio ({aspect:.2f}) is far outside any '
+                    f'standard document format (letter 0.77, A4 0.71, '
+                    f'landscape ~1.3). Image appears heavily cropped, '
+                    f'likely hiding portions of the form below the '
+                    f'visible fields.',
+                    'warning',
+                    20
+                )
+
+            # Check 2c (NEW 2026-08-13, Myssy Clayson): Text color channel
+            # analysis. Legit tax documents print in black. Blue/red/green
+            # machine text is a template-overlay tell — someone typed fields
+            # into a form template rather than exporting from real payer
+            # software.
+            self._check_text_color_channel(img_array, results)
+
             # Check 3: Color analysis - pay stubs are usually mostly white/light
             results['checks_performed'].append('Color distribution analysis')
             
