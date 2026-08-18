@@ -17,6 +17,21 @@ st.set_page_config(
     layout="wide"
 )
 
+# Bridge Streamlit Cloud secrets -> environment so DocumentAnalyzer (which reads
+# os.environ['ANTHROPIC_API_KEY']) sees the key whether it is provided via the
+# shell (local) or via Streamlit secrets (Cloud). Without this the entire AI
+# vision layer can be silently disabled in production. Added 2026-08-18.
+try:
+    if not os.environ.get("ANTHROPIC_API_KEY") and "ANTHROPIC_API_KEY" in st.secrets:
+        os.environ["ANTHROPIC_API_KEY"] = str(st.secrets["ANTHROPIC_API_KEY"])
+except Exception:
+    pass
+try:
+    if not os.environ.get("ANTHROPIC_MODEL") and "ANTHROPIC_MODEL" in st.secrets:
+        os.environ["ANTHROPIC_MODEL"] = str(st.secrets["ANTHROPIC_MODEL"])
+except Exception:
+    pass
+
 # Custom CSS
 st.markdown("""
 <style>
@@ -95,9 +110,10 @@ with col1:
     st.title("🔍 VICTIG Document Fraud Detector")
     st.markdown("*AI-powered analysis for employment verification documents*")
 with col2:
-    st.markdown("### v2.0")
+    st.markdown("### v2.1")
     ai_status = "🟢 AI Enabled" if os.environ.get('ANTHROPIC_API_KEY') else "⚪ AI Disabled"
     st.caption(ai_status)
+    st.caption("build 2026-08-18 · font-size + AI-model fix")
 
 # Sidebar
 with st.sidebar:

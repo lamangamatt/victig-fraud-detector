@@ -665,20 +665,69 @@ class DocumentAnalyzer:
             return ""
     
     def _pdf_to_image(self, file_path: str, dpi: int = 200) -> Optional[Image.Image]:
-        """Convert first page of PDF to image for visual analysis."""
+        """Rasterize the most form-like page of a PDF for visual analysis.
+
+        Previously this always used page 0. For multi-page submissions where a
+        tax form is accompanied by a cover letter (the applicant "provided a
+        W-2 with a letter"), page 0 is the letter and the actual W-2/1099 was
+        never visually or AI-analyzed — so form-specific tells (font sizes,
+        box structure, overlay ink on the values) were missed entirely.
+        We now pick the page with the most form structure, falling back to
+        page 0. Added 2026-08-18 based on Myssy Clayson feedback.
+        """
         if not HAS_PYMUPDF:
             return None
-        
+
         try:
             doc = fitz.open(file_path)
-            page = doc[0]
-            mat = fitz.Matrix(dpi/72, dpi/72)
-            pix = page.get_pixmap(matrix=mat)
-            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-            doc.close()
-            return img
-        except:
+            try:
+                idx = self._select_form_page(doc, dpi=110)
+                page = doc[idx]
+                mat = fitz.Matrix(dpi/72, dpi/72)
+                pix = page.get_pixmap(matrix=mat)
+                img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                self._rasterized_page_index = idx
+                return img
+            finally:
+                doc.close()
+        except Exception:
             return None
+
+    def _select_form_page(self, doc, dpi: int = 110) -> int:
+        """Pick the PDF page most likely to hold the tax form (W-2/1099/stub).
+
+        Tax forms are a grid of boxes, so they contain many full-width
+        horizontal rule lines and box borders; cover letters contain almost
+        none. Score each page by its count of long horizontal/vertical dark
+        runs and return the highest-scoring page. Falls back to page 0 when no
+        page is clearly form-like or on any error (preserves prior behavior
+        for single-page and letter-only documents).
+        """
+        try:
+            if doc.page_count <= 1:
+                return 0
+            best_idx, best_score = 0, -1
+            for i in range(doc.page_count):
+                try:
+                    pix = doc[i].get_pixmap(matrix=fitz.Matrix(dpi / 72, dpi / 72))
+                    arr = np.array(
+                        Image.frombytes("RGB", [pix.width, pix.height], pix.samples).convert("L"),
+                        dtype=float,
+                    )
+                    dark = arr < 180
+                    # rows / columns that are mostly dark = rule lines / borders
+                    hlines = int((dark.mean(axis=1) > 0.4).sum())
+                    vlines = int((dark.mean(axis=0) > 0.4).sum())
+                    score = hlines + vlines
+                    if score > best_score:
+                        best_score, best_idx = score, i
+                except Exception:
+                    continue
+            # Require a meaningful amount of form structure before overriding
+            # page 0; otherwise keep the original first-page behavior.
+            return best_idx if best_score >= 5 else 0
+        except Exception:
+            return 0
     
     def _ocr_image(self, file_path: str) -> str:
         """Run OCR on image."""
@@ -1805,6 +1854,98 @@ class DocumentAnalyzer:
         except Exception:
             # Never let a visual heuristic break the analyzer.
             pass
+
+    def _check_font_size_consistency(self, img_array, results: Dict) -> None:
+        """Backstop CV check: flag several distinct font sizes among typed text
+        when overlay signals corroborate.
+
+        A single payroll/tax system renders all field values at one consistent
+        size. When a form is assembled by typing/pasting values in multiple
+        passes, the values land at several distinct sizes. Detecting precise
+        per-value size from a compressed scan is unreliable, so this is a
+        deliberately conservative BACKSTOP to the AI vision check: it only
+        escalates when it sees >=3 well-separated, well-populated text-line
+        heights AND an independent overlay tell already fired (non-black ink or
+        inconsistent/bimodal darkness). Absent corroboration it stays silent,
+        because a legitimate form naturally uses a few sizes (tax year, labels,
+        values). Added 2026-08-18 (Myssy Clayson: 3 font sizes in a W-2 the
+        detector never reported).
+        """
+        try:
+            if img_array is None:
+                return
+            arr = np.asarray(img_array, dtype=float)
+            if arr.ndim == 3:
+                gray = 0.299 * arr[:, :, 0] + 0.587 * arr[:, :, 1] + 0.114 * arr[:, :, 2]
+            else:
+                gray = arr
+            H, W = gray.shape
+            dark = gray < 150
+            if int(dark.sum()) < 300:
+                return
+            # Segment horizontal text-line bands; band height tracks font size.
+            row_has = dark.sum(axis=1) > max(3, W * 0.003)
+            bands = []
+            run = 0
+            for v in row_has:
+                if v:
+                    run += 1
+                else:
+                    if run > 0:
+                        bands.append(run)
+                        run = 0
+            if run > 0:
+                bands.append(run)
+            heights = np.array(
+                sorted(h for h in bands if 8 <= h <= H * 0.05), dtype=float
+            )
+            results['text_line_bands'] = int(len(heights))
+            if len(heights) < 8:
+                return
+            # Greedy 1-D clustering: split whenever consecutive heights jump
+            # more than 16% (a real size step); dense continua stay merged.
+            clusters = [[heights[0]]]
+            for x in heights[1:]:
+                if x <= clusters[-1][-1] * 1.16:
+                    clusters[-1].append(x)
+                else:
+                    clusters.append([x])
+            total = len(heights)
+            dominant = [c for c in clusters if len(c) >= max(3, 0.10 * total)]
+            results['distinct_text_sizes'] = len(dominant)
+            if len(dominant) < 3:
+                return
+            if not self._has_overlay_corroboration():
+                return
+            if any(f.get('title') == 'Inconsistent Font Sizes' for f in self.flags):
+                return
+            sizes = ", ".join(f"~{int(np.median(c))}px" for c in dominant)
+            self._add_flag(
+                'Inconsistent Font Sizes',
+                f'Typed text appears at {len(dominant)} distinct sizes ({sizes}). '
+                f'Legitimate payroll/tax output renders all field values at a '
+                f'single size; multiple sizes among the values indicate data '
+                f'assembled or typed in separate passes. Flagged here because '
+                f'overlay ink/darkness signals are also present on this document.',
+                'warning',
+                20,
+            )
+        except Exception:
+            # Never let a heuristic break the analyzer.
+            pass
+
+    def _has_overlay_corroboration(self) -> bool:
+        """True when an independent template-overlay tell has already fired.
+
+        Gates the font-size backstop so it cannot false-positive on a clean
+        scan (which naturally contains a few font sizes).
+        """
+        overlay_titles = {
+            'Non-Black Machine Text',
+            'Inconsistent Text Darkness',
+            'Bimodal Text Darkness Pattern',
+        }
+        return any(f.get('title') in overlay_titles for f in self.flags)
 
     def _compound_info_flags(self):
         """Aggregate low-severity signals into a single warning.
@@ -3055,6 +3196,11 @@ class DocumentAnalyzer:
                                     30
                                 )
                                 results['anomalies'].append('Bimodal darkness distribution (template overlay likely)')
+
+            # Check 7 (NEW 2026-08-18, Myssy Clayson): font-size inconsistency
+            # among the typed values. Runs last so it can corroborate against
+            # the darkness/color overlay flags fired above.
+            self._check_font_size_consistency(img_array, results)
         except Exception as e:
             results['error'] = str(e)
         
@@ -3103,29 +3249,62 @@ Flags Found So Far: {len(self.flags)}
             else:
                 prompt = self._build_employment_ai_prompt(doc_type, context)
 
-            response = self.ai_client.messages.create(
-                model="claude-sonnet-4-20250514",
-                max_tokens=1500,
-                messages=[
-                    {
-                        "role": "user",
-                        "content": [
+            # Model resilience (2026-08-18, Myssy Clayson investigation): the
+            # previously-pinned "claude-sonnet-4-20250514" now returns 404
+            # (retired), which had silently disabled ALL AI vision analysis -
+            # the detector was running on CV/text checks only, so AI-only tells
+            # (font sizes, box structure, date tampering) were never caught.
+            # Use a current default, allow an ANTHROPIC_MODEL env override, and
+            # fall back across known-good models so a single deprecation cannot
+            # disable the AI layer again.
+            _model_candidates = [
+                os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-5"),
+                "claude-sonnet-4-5",
+                "claude-sonnet-4-5-20250929",
+            ]
+            _seen = set()
+            _models = [m for m in _model_candidates if m and not (m in _seen or _seen.add(m))]
+            response = None
+            _last_err = None
+            for _m in _models:
+                try:
+                    response = self.ai_client.messages.create(
+                        model=_m,
+                        # 2500 -> the structured JSON (font/date/visual/template/
+                        # manipulation/box-structure/findings) was overflowing the
+                        # old 1500 cap and truncating, which made json.loads fail
+                        # and silently dropped ALL AI flags on ~1/3 of runs.
+                        max_tokens=2500,
+                        messages=[
                             {
-                                "type": "image",
-                                "source": {
-                                    "type": "base64",
-                                    "media_type": media_type,
-                                    "data": img_data,
-                                },
-                            },
-                            {
-                                "type": "text",
-                                "text": prompt,
-                            },
+                                "role": "user",
+                                "content": [
+                                    {
+                                        "type": "image",
+                                        "source": {
+                                            "type": "base64",
+                                            "media_type": media_type,
+                                            "data": img_data,
+                                        },
+                                    },
+                                    {
+                                        "type": "text",
+                                        "text": prompt,
+                                    },
+                                ],
+                            }
                         ],
-                    }
-                ],
-            )
+                    )
+                    self._ai_model_used = _m
+                    break
+                except Exception as _e:
+                    _last_err = _e
+                    # Only fall through on model-not-found; surface other errors.
+                    if "not_found" in str(_e) or "404" in str(_e):
+                        continue
+                    raise
+            if response is None:
+                raise _last_err if _last_err else RuntimeError("AI model call failed")
 
             # Parse the response
             response_text = response.content[0].text
@@ -3154,12 +3333,30 @@ Flags Found So Far: {len(self.flags)}
                             20,
                         )
                     else:
-                        self._add_flag(
-                            'AI Analysis: Appears Legitimate',
-                            f"AI analysis found no significant fraud indicators ({confidence}% confidence).",
-                            'info',
-                            -10,
+                        # Guardrail (2026-08-18): the AI's benefit-of-the-doubt
+                        # must not override strong non-AI signals. If a critical
+                        # document-integrity flag already fired (e.g. bimodal
+                        # template-overlay darkness), do NOT discount the score -
+                        # a lenient/variable AI read otherwise let genuinely
+                        # tampered forms fall back to LOW.
+                        has_critical = any(
+                            f.get('severity') == 'critical' for f in self.flags
                         )
+                        if has_critical:
+                            self._add_flag(
+                                'AI Analysis: Inconclusive',
+                                f"AI did not independently confirm fraud ({confidence}% confidence), "
+                                f"but critical document-integrity flags are present, so the score is not discounted.",
+                                'info',
+                                0,
+                            )
+                        else:
+                            self._add_flag(
+                                'AI Analysis: Appears Legitimate',
+                                f"AI analysis found no significant fraud indicators ({confidence}% confidence).",
+                                'info',
+                                -10,
+                            )
 
                     if doc_type in education_types:
                         self._apply_education_ai_flags(ai_result)
@@ -3305,6 +3502,17 @@ ANALYZE FOR:
    Treat font differences as a formatting artifact of reproduction, NOT a fraud
    signal, unless supported by substantive inconsistencies in the data itself.
 
+   FONT SIZE AMONG THE ENTERED VALUES (important - commonly missed):
+   Separately from typeface/weight, compare the SIZE (character height) of the
+   TYPED DATA VALUES across the form - wages, tax amounts, name, SSN, EIN, and
+   the Box 12/14 entries. A single payroll/tax system prints ALL field values
+   at one consistent size. Two or more clearly different sizes AMONG THE VALUES
+   (not the pre-printed labels, and setting aside the tax year which is
+   intentionally larger) indicate the values were typed or pasted in separate
+   passes onto a template. Report this in "value_size_inconsistency" with the
+   specific boxes that differ. Value-size mismatch is itself a strong overlay
+   tell when clearly present.
+
 2. **Year/Date Tampering** (CRITICAL - Very common on fake W-2s)
    - Is the tax year clearly visible and in the same font as other text?
    - Look for years that appear printed ON TOP of other text (overprint)
@@ -3395,7 +3603,12 @@ RESPOND IN THIS JSON FORMAT:
     "font_consistency": {{
         "consistent": true/false,
         "issues": ["only list font issues that are corroborated by other fraud indicators (data inconsistencies, digital editing signs, etc). Do NOT list scan/photocopy artifacts."],
-        "corroborating_indicators": ["list the OTHER fraud indicators that support each font flag (e.g., 'altered numbers in same field', 'mismatched EIN'). If empty, do not flag font issues."]
+        "corroborating_indicators": ["list the OTHER fraud indicators that support each font flag (e.g., 'altered numbers in same field', 'mismatched EIN'). If empty, do not flag font issues."],
+        "value_size_inconsistency": {{
+            "detected": true/false,
+            "sizes_observed": 0,
+            "fields": ["specific VALUE fields/boxes rendered at a different size than the other values, e.g. 'Box 1 wages larger than the Box 2/4/6 tax figures', 'Box 14 values smaller than Boxes 1-6'"]
+        }}
     }},
     "date_year_tampering": {{
         "detected": true/false,
@@ -3536,6 +3749,30 @@ RESPOND IN THIS JSON FORMAT:
                         'warning',
                         10,
                     )
+
+        # NEW 2026-08-18 (Myssy Clayson): explicit font-SIZE inconsistency among
+        # the typed values. Fire when the model reports 2+ distinct value sizes
+        # and corroboration exists (AI-provided indicators, or an overlay
+        # ink/darkness flag already fired in visual forensics). Deduped against
+        # the CV backstop, which may have already added this flag.
+        size_check = (font_check or {}).get('value_size_inconsistency', {}) or {}
+        if size_check.get('detected'):
+            fields = size_check.get('fields', []) or []
+            n_sizes = size_check.get('sizes_observed')
+            corroborated = bool(font_check.get('corroborating_indicators')) or self._has_overlay_corroboration()
+            already = any(f.get('title') == 'Inconsistent Font Sizes' for f in self.flags)
+            if corroborated and not already:
+                detail = "; ".join(fields[:3]) if fields else "the typed values render at multiple sizes"
+                count = f"{n_sizes} distinct sizes" if isinstance(n_sizes, int) and n_sizes else "multiple sizes"
+                self._add_flag(
+                    'Inconsistent Font Sizes',
+                    f'The W-2/1099 values appear in {count}: {detail}. A single '
+                    f'payroll system prints all field values at one size; '
+                    f'differing sizes among the values indicate data typed or '
+                    f'pasted onto a template in separate passes.',
+                    'warning',
+                    20,
+                )
 
         # Date / year tampering
         date_check = ai_result.get('date_year_tampering', {})

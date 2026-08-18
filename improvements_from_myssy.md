@@ -1,5 +1,54 @@
 # VICTIG Fraud Detector Improvements
 
+## 2026-08-18 — W-2 Font-Size Miss + Dead AI Model (Kelly Vasquez)
+
+**Reporter:** Myssy Clayson (VICTIG Verifications). **Sample:** a fabricated
+2023 W-2 for "Kelly Vasquez" submitted as a PDF with a cover "wage
+verification" letter (Dean C. Limited Partnership). The detector flagged the
+ink shades but "did not catch the 3 different font sizes used in the W-2s."
+
+Investigation surfaced FOUR issues:
+
+1. **Dead AI model (biggest).** The AI vision call was pinned to
+   `claude-sonnet-4-20250514`, which now returns 404 (retired). The entire AI
+   layer was silently failing (`available: false`), so every AI-only tell —
+   font sizes, box structure, date tampering — went unevaluated in production.
+   Fixed: model defaults to `claude-sonnet-4-5`, overridable via
+   `ANTHROPIC_MODEL`, with fallback across known-good models so one deprecation
+   can't disable AI again.
+
+2. **Cover-letter page analyzed instead of the W-2.** `_pdf_to_image` only
+   rasterized page 0. For a "W-2 + letter" PDF the letter is page 0, so the
+   actual W-2 was never visually/AI analyzed (the ink flags Myssy saw were
+   firing on the letter's blue signature). Added `_select_form_page`: scores
+   each page's form structure (rule lines / box borders) and rasterizes the
+   most form-like page, falling back to page 0.
+
+3. **No font-size check.** Added explicit font-SIZE-among-values analysis to
+   the AI prompt (`value_size_inconsistency`) and a new "Inconsistent Font
+   Sizes" warning (+20) in `_apply_employment_ai_flags`, fired when the model
+   reports 2+ distinct value sizes AND corroboration exists (AI indicators or
+   an overlay ink/darkness flag). Added a pure-numpy CV backstop
+   `_check_font_size_consistency` (warning +20) that fires on >=3 distinct
+   text-line-height clusters when an overlay tell already fired — gated so it
+   cannot false-positive on clean scans.
+
+4. **AI leniency could bury a tampered form.** On borderline scans the AI
+   sometimes returns "legitimate," and the old code then subtracted 10 —
+   enough to drop this W-2 to LOW. Guardrail added: the "Appears Legitimate"
+   -10 no longer applies when a CRITICAL structural flag is present. Also
+   raised AI `max_tokens` 1500 → 2500; the structured JSON was overflowing and
+   truncating on ~1/3 of runs, making json.loads fail and silently dropping all
+   AI flags.
+
+**Result on the sample (production path, AI on):** now analyzes the W-2 and
+lands HIGH (100) on the majority of runs with an explicit "Inconsistent Font
+Sizes" flag, and never below MEDIUM (the critical bimodal-darkness flag +
+guardrail floor it). Regression: `test_myssy_2026_08_18.py`. All prior Myssy
+regression tests still pass.
+
+---
+
 ## 2026-08-13 — Blue-ink 1099-NEC Miss (issue #1)
 
 **Reporter:** Myssy Clayson (VICTIG Verifications).
