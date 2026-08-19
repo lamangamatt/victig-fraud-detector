@@ -7,3 +7,6 @@ test-samples/
 # Real applicant samples — contain PII, never commit
 samples/
 
+
+# Draft customer replies (may contain applicant names/case numbers)
+reply-to-*.md
