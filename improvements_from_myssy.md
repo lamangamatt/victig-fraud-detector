@@ -639,3 +639,70 @@ With more clean IRS transcript samples in hand we could revisit:
   (font, spacing, right-justification of Submission Type).
 
 *Changes implemented by Molesley, 2026-07-13*
+
+---
+
+## 2026-08-19 — False positives on a redacted VillageMD/ADP paystub PHOTO
+
+**Report** (email #245, "Fwd: #2727744 - MORGAN, JULIE ANN - VILLAGE
+MEDICAL/PRIMARY CARE", forwarded by Myssy/Trish): a phone photo of a physical
+VillageMD/ADP earnings statement (Julie Morgan), all dollar amounts
+hand-redacted, scored **100/100** on two flags Myssy called out as wrong:
+
+1. **"Date/Year Tampering Detected — future dates."** The AI vision layer
+   flagged the June-2026 pay period (06/07/2026–06/20/2026) and advice date
+   (06/26/2026) as *future-dated* even though the document was analysed on
+   2026-08-19 (those dates are in the **past**). The AI even wrote "analyzed in
+   2024/2025." Root cause: the vision prompt never told the model today's date,
+   so it inferred "now" from training data and treated any 2026 date as future.
+
+2. **"Non-Black Machine Text — 56% renders in red (mean RGB 91,61,31)."**
+   That RGB is a warm-light **brown**, not red — an artifact of photographing
+   black ink under warm indoor light on a wood table. The hue test
+   (`R > G+25 and R > B+25`) mis-read the warm colour cast as red ink.
+
+### Fixes (document_analyzer.py + app.py)
+
+A. **Date awareness (prompt).** Injected `Today's Date` into the AI vision
+   CONTEXT and added an explicit rule to the "Year/Date Tampering" section:
+   pay periods / pay dates / tax years on or before today are NORMAL; only
+   dates genuinely AFTER today are future-dated. Do not infer "now" from memory.
+
+B. **Date awareness (deterministic backstop).** New
+   `_is_false_future_date_claim(issue)`: if a `date_year_tampering` issue is
+   phrased as a future-date claim but none of the dates it cites are actually
+   after today, the "Date/Year Tampering Detected" flag is dropped. Genuine
+   future dates and non-future tampering language (overprint, covered/edited
+   dates) are untouched.
+
+C. **Warm-photo colour cast (white balance).** `_check_text_color_channel` now
+   estimates the paper white point from the bright background and white-balances
+   the text pixels before judging hue. A neutral scan/export has gains ~1.0
+   (behaviour unchanged — the 2026-08-13 blue-1099 detection still fires); a
+   warm phone photo normalises out. Also tightened the red rule: genuine red
+   must be reasonably bright (`mean_r >= 110`) with its two other channels close
+   together (`|G-B| <= 30`), which rejects dark brown warm-light ramps.
+
+### Verification
+- `test_myssy_2026_08_19.py` (no API key needed):
+  - future-date backstop: 9/9 cases correct (past→suppress, real-future→keep,
+    non-date-tamper→keep);
+  - colour controls: blue scan flags, red scan flags, warm-brown cast does NOT
+    flag, warm-lit **genuine** red still flags;
+  - real paystub photo (use_ai=False) fires **neither** reported false positive
+    (paper white (214,205,196) spread 18.1 → warm cast detected & corrected).
+- End-to-end with AI enabled (claude-sonnet-4-5) on the real sample:
+  `date_year_tampering.detected = False` (no future-date flag), no red-ink flag.
+- All prior Myssy regression tests (07-03 … 08-13) still PASS.
+
+### Residual / open question for Matt (NOT changed here)
+Even with both reported FPs fixed, the document still scores HIGH/MEDIUM because
+(a) every wage/tax/deduction is blacked out and the AI reads the comprehensive
+redaction + the black bars as "suspicious digital manipulation," and (b) the
+uneven lighting of a photographed physical page trips "Bimodal Text Darkness."
+These are arguably a *third* class of false positive — the tool conflates
+"over-redacted, can't verify" with "fraudulent." Fixing that is a policy call
+(should a fully-redacted paystub ESCALATE for an unredacted copy rather than
+read as fraud?) and was left for Matt to decide.
+
+*Changes implemented by Molesley, 2026-08-19*

@@ -110,10 +110,10 @@ with col1:
     st.title("🔍 VICTIG Document Fraud Detector")
     st.markdown("*AI-powered analysis for employment verification documents*")
 with col2:
-    st.markdown("### v2.1")
+    st.markdown("### v2.2")
     ai_status = "🟢 AI Enabled" if os.environ.get('ANTHROPIC_API_KEY') else "⚪ AI Disabled"
     st.caption(ai_status)
-    st.caption("build 2026-08-18 · font-size + AI-model fix")
+    st.caption("build 2026-08-19 · date-awareness + warm-photo colour fix")
 
 # Sidebar
 with st.sidebar:

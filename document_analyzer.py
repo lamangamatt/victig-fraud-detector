@@ -1806,10 +1806,40 @@ class DocumentAnalyzer:
                 # image; skip to avoid false positives.
                 return
 
+            # White-balance against the paper white point before judging ink
+            # hue. A phone photo of a physical document under warm indoor light
+            # (or on a wood surface) casts neutral black ink toward brown, which
+            # naively reads as "red". Scans/exports already have a near-neutral
+            # white point, so their gains stay ~1.0 and behaviour is unchanged;
+            # only genuinely tinted photos get corrected. (Myssy Clayson
+            # 2026-08-19: a redacted VillageMD/ADP paystub PHOTO scored 100/100
+            # partly on a false "56% renders in red" flag where the measured ink
+            # was RGB (91,61,31) - a warm-light brown, not red.)
+            gain_r = gain_g = gain_b = 1.0
+            bright_mask = luma > 200
+            if int(bright_mask.sum()) >= max(1000, total_text):
+                wr = float(r[bright_mask].mean())
+                wg = float(g[bright_mask].mean())
+                wb = float(b[bright_mask].mean())
+                w_avg = (wr + wg + wb) / 3.0
+                paper_spread = max(wr, wg, wb) - min(wr, wg, wb)
+                results['paper_white_rgb'] = (round(wr, 1), round(wg, 1), round(wb, 1))
+                results['paper_white_spread'] = round(paper_spread, 1)
+                # Correct only when the paper itself is meaningfully tinted (a
+                # real colour cast), with bounded gains so we never invent or
+                # destroy genuine ink colour.
+                if paper_spread > 12 and min(wr, wg, wb) > 1:
+                    gain_r = min(max(w_avg / wr, 0.5), 2.0)
+                    gain_g = min(max(w_avg / wg, 0.5), 2.0)
+                    gain_b = min(max(w_avg / wb, 0.5), 2.0)
+            r_bal = r * gain_r
+            g_bal = g * gain_g
+            b_bal = b * gain_b
+
             # Exclude near-gray pixels (real black ink prints as neutral
             # gray under scan compression). We only care about coloured text.
-            channel_max = np.maximum(np.maximum(r, g), b)
-            channel_min = np.minimum(np.minimum(r, g), b)
+            channel_max = np.maximum(np.maximum(r_bal, g_bal), b_bal)
+            channel_min = np.minimum(np.minimum(r_bal, g_bal), b_bal)
             saturation = channel_max - channel_min  # simple RGB spread
             colored_text_mask = text_mask & (saturation > 25)
 
@@ -1826,11 +1856,11 @@ class DocumentAnalyzer:
             if colored_ratio < 0.05:
                 return
 
-            # Compute mean RGB of the colored text pixels to identify the
-            # dominant hue.
-            mean_r = float(r[colored_text_mask].mean())
-            mean_g = float(g[colored_text_mask].mean())
-            mean_b = float(b[colored_text_mask].mean())
+            # Compute mean RGB of the colored text pixels (white-balanced) to
+            # identify the dominant hue.
+            mean_r = float(r_bal[colored_text_mask].mean())
+            mean_g = float(g_bal[colored_text_mask].mean())
+            mean_b = float(b_bal[colored_text_mask].mean())
             results['colored_text_rgb'] = (
                 round(mean_r, 1),
                 round(mean_g, 1),
@@ -1842,13 +1872,20 @@ class DocumentAnalyzer:
             # trigger — only clearly non-black machine text should hit.
             if mean_b > mean_r + 25 and mean_b > mean_g + 15:
                 hue = 'blue'
-            elif mean_r > mean_g + 25 and mean_r > mean_b + 25:
+            elif (mean_r > mean_g + 25 and mean_r > mean_b + 25
+                  and mean_r >= 110 and abs(mean_g - mean_b) <= 30):
+                # Genuine red ink is reasonably bright AND has its two other
+                # channels low and close together. A dark, monotonic R>G>B ramp
+                # with a wide G/B gap is warm-light brown (a photo colour cast),
+                # not red — reject it even if white-balancing left a residual
+                # tint.
                 hue = 'red'
             elif mean_g > mean_r + 25 and mean_g > mean_b + 25:
                 hue = 'green'
             else:
-                # Colored pixels but no dominant hue — could be a
-                # multi-color logo; not conclusive of tampering.
+                # Colored pixels but no dominant hue, or a warm-light brown
+                # cast — could be a multi-color logo or lighting tint; not
+                # conclusive of tampering.
                 return
 
             self._add_flag(
@@ -3245,6 +3282,7 @@ class DocumentAnalyzer:
             
             # Build context from current findings
             context = f"""
+Today's Date: {datetime.now().strftime('%Y-%m-%d')}
 Document Type: {doc_type}
 Creator Software: {current_results.get('metadata', {}).get('creator', 'Unknown')}
 Creation Date: {current_results.get('metadata', {}).get('creation_date', 'Unknown')}
@@ -3525,6 +3563,16 @@ ANALYZE FOR:
    tell when clearly present.
 
 2. **Year/Date Tampering** (CRITICAL - Very common on fake W-2s)
+   DATE CONTEXT (read this before flagging ANY date):
+   - Today's date is provided as "Today's Date" in the CONTEXT block above. Use
+     it as "now". Do NOT infer the current date from memory or training data.
+   - Pay stubs, W-2s, and 1099s normally show dates in the PAST relative to
+     today. A pay period, pay/advice date, or tax year that falls ON OR BEFORE
+     today's date is NORMAL and must NOT be reported as "future-dated".
+   - Only report a date as future-dated (a fraud indicator) if it is genuinely
+     AFTER today's date. Example: if today is 2026-08-19, a pay period of
+     06/07/2026-06/20/2026 and an advice date of 06/26/2026 are all in the PAST
+     and are NORMAL - do not flag them.
    - Is the tax year clearly visible and in the same font as other text?
    - Look for years that appear printed ON TOP of other text (overprint)
    - Check for black boxes, white boxes, or rectangles covering original dates with new dates overlaid
@@ -3743,6 +3791,62 @@ RESPOND IN THIS JSON FORMAT:
                     30,
                 )
 
+    def _is_false_future_date_claim(self, issue: str) -> bool:
+        """True when an AI date-tampering 'issue' is a 'future-dated' claim whose
+        cited dates are not actually after today.
+
+        The vision model often mislabels a legitimate PAST pay period, advice/pay
+        date, or tax year as 'future-dated' because it does not reliably know the
+        current date. Suppress only when (a) the issue is phrased as a future
+        claim AND (b) every date it cites is on or before today. Any genuinely
+        future date keeps the flag; non-future tampering language (overprint,
+        covered/edited dates, font mismatch) is never touched. Added 2026-08-19
+        (Myssy Clayson: June-2026 paystub analysed in Aug-2026 flagged future).
+        """
+        text = (issue or '').lower()
+        future_terms = (
+            'future', "haven't occurred", "hasn't occurred", 'hasnt occurred',
+            'have not occurred', 'has not occurred', 'not yet occurred',
+            'yet to occur', 'not occurred yet', "haven't happened",
+            "hasn't happened", 'cannot be issued', "can't be issued",
+            'impossible date', 'dated in the future', 'in the future',
+        )
+        if not any(t in text for t in future_terms):
+            return False
+        today = datetime.now().date()
+        found_date = False
+        has_future = False
+        # Full dates: M/D/Y or M-D-Y (2- or 4-digit year).
+        for mo, dy, yr in re.findall(r'\b(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})\b', issue):
+            try:
+                mo, dy, yr = int(mo), int(dy), int(yr)
+                if yr < 100:
+                    yr += 2000
+                if not (1 <= mo <= 12 and 1 <= dy <= 31):
+                    continue
+                found_date = True
+                if datetime(yr, mo, dy).date() > today:
+                    has_future = True
+            except Exception:
+                continue
+        # ISO dates: Y-M-D.
+        for yr, mo, dy in re.findall(r'\b(\d{4})-(\d{1,2})-(\d{1,2})\b', issue):
+            try:
+                yr, mo, dy = int(yr), int(mo), int(dy)
+                if not (1 <= mo <= 12 and 1 <= dy <= 31):
+                    continue
+                found_date = True
+                if datetime(yr, mo, dy).date() > today:
+                    has_future = True
+            except Exception:
+                continue
+        # Bare 4-digit years (2000-2099).
+        for yr in re.findall(r'\b(20\d{2})\b', issue):
+            found_date = True
+            if int(yr) > today.year:
+                has_future = True
+        return found_date and not has_future
+
     def _apply_employment_ai_flags(self, ai_result: Dict, doc_type: str) -> None:
         """Turn employment / tax-document AI JSON into fraud flags."""
         # Font consistency - only flag when AI provided corroborating indicators.
@@ -3789,6 +3893,16 @@ RESPOND IN THIS JSON FORMAT:
         date_check = ai_result.get('date_year_tampering', {})
         if date_check.get('detected'):
             for issue in date_check.get('issues', [])[:2]:
+                # Guard against the model's most common date hallucination:
+                # calling a PAST pay period / pay date / tax year "future-dated"
+                # because it does not reliably know today's date. If the issue is
+                # fundamentally a future-date claim but none of the dates it
+                # cites are actually after today, drop it. (Myssy Clayson
+                # 2026-08-19: a June-2026 paystub analysed in Aug-2026 was
+                # flagged "future-dated".) Other tampering claims (overprint,
+                # covered/edited dates, font mismatch) are unaffected.
+                if self._is_false_future_date_claim(issue):
+                    continue
                 self._add_flag(
                     'Date/Year Tampering Detected',
                     issue,
