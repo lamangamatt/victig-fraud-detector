@@ -1674,7 +1674,18 @@ class DocumentAnalyzer:
             data.get('medicare_tax'),
             data.get('state_tax'),
         ]
-        has_withholding = any(v is not None and float(v) > 0 for v in withholding_fields)
+        # Note: float() must tolerate comma-formatted strings (e.g. "1,234.56")
+        # that the AI now returns in full JSON responses (max_tokens raised
+        # 1500→2500 in 66b276d means previously-truncated fields now arrive).
+        has_withholding = False
+        for _v in withholding_fields:
+            if _v is not None:
+                try:
+                    if float(str(_v).replace(',', '').replace('$', '').strip()) > 0:
+                        has_withholding = True
+                        break
+                except (TypeError, ValueError):
+                    pass
 
         # Also scan raw text for withholding clues if structured data is missing
         if not has_withholding:
