@@ -697,11 +697,24 @@ class DocumentAnalyzer:
         """Pick the PDF page most likely to hold the tax form (W-2/1099/stub).
 
         Tax forms are a grid of boxes, so they contain many full-width
-        horizontal rule lines and box borders; cover letters contain almost
-        none. Score each page by its count of long horizontal/vertical dark
-        runs and return the highest-scoring page. Falls back to page 0 when no
-        page is clearly form-like or on any error (preserves prior behavior
-        for single-page and letter-only documents).
+        horizontal rule lines and box borders; cover letters and instruction
+        pages contain almost none. Score each page by:
+          (a) `hlines + vlines` — rows/cols with >40% dark pixels. This is a
+              coarse signal that also fires on dense body text, but keeps the
+              detector working on fabricated forms whose "borders" are dashed
+              or partial (Myssy Clayson 2026-08-18: fake W-2 whose rules
+              weren't perfectly solid).
+          (b) `long_row + long_col` — rows/cols containing a SOLID continuous
+              run of dark pixels spanning more than half the page dimension.
+              Only real form rules produce these; prose paragraphs cannot
+              because letters have inter-glyph gaps. Weighted 5x because it
+              is uniquely diagnostic of a form (Myssy Clayson 2026-08-21:
+              7-page W-2 PDF whose Instructions-for-Employee page 5 tied
+              the actual W-2 pages under the old coarse-only score, so the
+              detector analyzed instructions instead of the W-2).
+
+        Falls back to page 0 when no page is clearly form-like or on any
+        error (preserves prior behavior for single-page docs).
         """
         try:
             if doc.page_count <= 1:
@@ -714,11 +727,28 @@ class DocumentAnalyzer:
                         Image.frombytes("RGB", [pix.width, pix.height], pix.samples).convert("L"),
                         dtype=float,
                     )
+                    H, W = arr.shape
                     dark = arr < 180
-                    # rows / columns that are mostly dark = rule lines / borders
+                    # Coarse: rows / columns that are mostly dark.
                     hlines = int((dark.mean(axis=1) > 0.4).sum())
                     vlines = int((dark.mean(axis=0) > 0.4).sum())
-                    score = hlines + vlines
+                    # Precise: max streak of consecutive dark pixels per row
+                    # (and per column). A vectorised cumulative-max reset:
+                    # streak[j] = streak[j-1] + 1 if dark else 0.
+                    long_row = 0
+                    long_col = 0
+                    if H and W:
+                        streak = np.zeros_like(dark, dtype=np.int32)
+                        streak[:, 0] = dark[:, 0].astype(np.int32)
+                        for j in range(1, W):
+                            streak[:, j] = np.where(dark[:, j], streak[:, j - 1] + 1, 0)
+                        long_row = int((streak.max(axis=1) > W * 0.5).sum())
+                        streak = np.zeros_like(dark, dtype=np.int32)
+                        streak[0, :] = dark[0, :].astype(np.int32)
+                        for r in range(1, H):
+                            streak[r, :] = np.where(dark[r, :], streak[r - 1, :] + 1, 0)
+                        long_col = int((streak.max(axis=0) > H * 0.5).sum())
+                    score = hlines + vlines + 5 * (long_row + long_col)
                     if score > best_score:
                         best_score, best_idx = score, i
                 except Exception:
@@ -3633,16 +3663,36 @@ ANALYZE FOR:
      and strongly suggest the document was assembled from a template or edited
      by hand.
 
-9. **Form Lines Crossing Through Text** (CRITICAL)
-   - Look for horizontal/vertical lines, dashed lines, or perforation marks that
-     physically cut THROUGH numbers, letters, or words (not between rows).
-   - Pay special attention to the state tax row (boxes 15, 16, 17): does a dashed
-     or solid line cut through the State code (e.g. "MO"), Employer's state ID
-     number, or any dollar amounts in those boxes?
-   - On genuine W-2s, text sits cleanly inside fields. When a line crosses through
-     the middle of characters, it almost always means the text was overlaid on top
-     of the form image rather than rendered by a real payroll system.
-   - Report exact box numbers where this occurs.
+9. **Form Lines Crossing OR Clipping Text** (CRITICAL)
+   Two related overlay tells belong here — flag EITHER:
+
+   (a) *Lines cutting THROUGH characters* — horizontal/vertical lines, dashed
+       lines, or perforation marks that physically cross THROUGH numbers,
+       letters, or words (not between rows). Pay special attention to the
+       state tax row (boxes 15, 16, 17): does a dashed or solid line cut
+       through the State code (e.g. "MO"), Employer's state ID number, or
+       any dollar amounts in those boxes?
+
+   (b) *Characters clipped by a cell boundary* — letters whose TOPS or
+       BOTTOMS are visibly truncated because the text was rendered above/below
+       the cell's top/bottom rule line. On a genuine payroll-system render,
+       every character sits fully inside its cell; when you see the top curves
+       of letters like P, S, N, Y, D, B, R sliced off flush with the box's
+       upper border (or descenders of g/p/y sliced off flush with the lower
+       border), the values were pasted on top of a fixed template that did
+       not size the cell for them. **W-2 Box 14** ('Other') is a common
+       location for this because Box 14 codes like NYPSL-E, NYSDI-E, or
+       benefit acronyms are typed as free-form text and are often positioned
+       carelessly by fabricated-document tools — zoom mentally on Box 14 and
+       check whether the letter tops meet the box border cleanly or are
+       shaved off. Also check the Box 12 code/amount rows and Box 15-17
+       state row.
+
+   On genuine W-2s, text sits cleanly inside fields. When a line crosses
+   through the middle of characters, OR when characters are shaved off at a
+   cell boundary, it almost always means the text was overlaid on top of the
+   form image rather than rendered by a real payroll system.
+   Report exact box numbers where this occurs.
 
 10. **Inconsistent or Missing Box Borders** (CRITICAL for W-2)
     - Compare the border thickness/darkness/completeness of each box against its
@@ -3702,7 +3752,7 @@ RESPOND IN THIS JSON FORMAT:
     }},
     "lines_crossing_text": {{
         "detected": true/false,
-        "issues": ["list each instance of a form line cutting through text, with box numbers, e.g. 'Dashed perforation line crosses through Employer state ID 14244519 in Box 15', 'Horizontal line cuts through MO state code'"]
+        "issues": ["list each instance where a form line either (a) CUTS THROUGH text (a line runs across the middle of characters), or (b) CLIPS text at a cell boundary (letter tops or bottoms shaved off flush with the box's top/bottom border, e.g. Box 14 codes like 'NYPSL-E' with the tops of P and S truncated). Include the box number and quote the affected text, e.g. 'Top of characters in Box 14 NYPSL-E and NYSDI-E clipped by cell top border', 'Dashed perforation line crosses through Employer state ID 14244519 in Box 15'"]
     }},
     "box_border_anomalies": {{
         "detected": true/false,
