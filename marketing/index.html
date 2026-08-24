@@ -574,16 +574,18 @@
     <h1>Stop fake pay stubs, diplomas, and professional certs <span class="accent">before they close the deal.</span></h1>
     <p class="hero-sub">
       VICTIG's Document Fraud Detector combines forensic metadata analysis, mathematical
-      validation, and Claude AI vision to catch fabricated employment, income, and
-      education documents that slip past manual review — in seconds, not hours.
+      validation, tax-form structure checks, cross-document consistency analysis, and Claude AI
+      vision to catch fabricated employment, income, and education documents that slip past
+      manual review — in seconds, not hours. Every rule has been tuned against real fraud
+      caught in production verification work.
     </p>
     <div class="hero-buttons">
       <a href="#request" class="btn btn-primary">Request a Demo</a>
       <a href="#how-it-works" class="btn btn-secondary">See How It Works →</a>
     </div>
     <div class="hero-stats">
-      <div class="hero-stat"><div class="num">7</div><div class="lbl">Document Types Supported</div></div>
-      <div class="hero-stat"><div class="num">6</div><div class="lbl">Detection Layers</div></div>
+      <div class="hero-stat"><div class="num">8</div><div class="lbl">Document Types Supported</div></div>
+      <div class="hero-stat"><div class="num">9</div><div class="lbl">Detection Layers</div></div>
       <div class="hero-stat"><div class="num">&lt; 30s</div><div class="lbl">Average Analysis Time</div></div>
       <div class="hero-stat"><div class="num">100%</div><div class="lbl">Documents Purged After Review</div></div>
     </div>
@@ -627,11 +629,12 @@
   <div class="container">
     <div class="section-head">
       <div class="eyebrow">Capabilities</div>
-      <h2>Five layers of detection working together.</h2>
+      <h2>Nine layers of detection working together.</h2>
       <p class="section-sub">
         Any single check can be beaten. Combining metadata forensics, math validation,
-        content analysis, visual forensics, and AI vision produces a fraud signal that's
-        remarkably hard to fake.
+        content analysis, visual and color forensics, tax-form structure checks,
+        cross-document consistency analysis, credential intelligence, and AI vision produces
+        a fraud signal that's remarkably hard to fake.
       </p>
     </div>
 
@@ -643,11 +646,12 @@
         </div>
         <p>Every file carries a digital fingerprint. We read it before anyone reads the document.</p>
         <ul>
-          <li>Creation and modification timestamps</li>
-          <li>Author, creator, and producing software</li>
-          <li>Edit history and revision markers</li>
-          <li>Flags documents created in Photoshop, Canva, or AI tools</li>
-          <li>Detects "January pay stub" created yesterday</li>
+          <li>Creation and modification timestamps — detects the "January pay stub" created yesterday, files modified after creation, and documents created the same day they're submitted</li>
+          <li>Author, creator, and producing software — 25+ image editors, PDF editors, and office tools risk-weighted individually (Photoshop ≠ Microsoft Word ≠ Acrobat)</li>
+          <li>Human-authored metadata tells — e.g. a PDF /Subject reading "Employment verification" on a form that should come straight from a payroll system</li>
+          <li>Redaction-aware scoring: when a candidate legitimately redacted PII, editing-software penalties are automatically reduced instead of crying wolf</li>
+          <li>File-type spoof detection (.pdf extension on a non-PDF file)</li>
+          <li>Documents from 20+ recognized payroll systems earn a <em>negative</em> risk adjustment — legitimate sources are rewarded, not just fraud punished</li>
         </ul>
       </div>
 
@@ -658,11 +662,14 @@
         </div>
         <p>Fraudsters change numbers without understanding tax law. Math doesn't lie.</p>
         <ul>
-          <li>Gross &minus; deductions = net (with tolerance)</li>
-          <li>Hours × rate = gross pay</li>
-          <li>Social Security tax at 6.2%, Medicare at 1.45%</li>
-          <li>Deduction ratios within realistic 15–45% range</li>
-          <li>W-2 Box 1, 3, 5 wage consistency</li>
+          <li>Gross &minus; deductions = net (with tolerance) — a net that exceeds gross is an instant critical flag</li>
+          <li>Hours × rate = gross pay reconciliation</li>
+          <li>Social Security tax at 6.2%, Medicare at 1.45%, impossible federal-withholding rates</li>
+          <li>Deduction ratios outside the realistic 15–45% band — suspiciously low <em>and</em> suspiciously high</li>
+          <li>W-2 Box 1 / 3 / 5 wage consistency</li>
+          <li>Implausibly low wages carrying tax withholding (sub-$2,000 W-2 wages with federal/state withholding — real workers at that income are generally exempt)</li>
+          <li>Missing two-digit cents on W-2 dollar amounts — IRS Pub. 1141 requires them; word-processor forgeries almost always omit them</li>
+          <li>Tax years in the future (impossible) or issued before year-end (premature)</li>
         </ul>
       </div>
 
@@ -674,25 +681,68 @@
         <p>Templated documents leave verbal fingerprints — if you know where to look.</p>
         <ul>
           <li>Placeholder text ("Lorem ipsum", "John Doe", "[Company Name]")</li>
-          <li>Inconsistent date formats across the document</li>
-          <li>Suspicious phrases like "proof of income" that real payroll never uses</li>
-          <li>SSN truncation compliance with IRS Pub 1586</li>
-          <li>W-2/1099 tax-year typographic checks</li>
+          <li>Invalid field values — "N/A", "NOT NEEDED", "None" in boxes real payroll software fills with $0.00 or leaves blank</li>
+          <li>EIN intelligence: format validity, geographic mismatch between EIN prefix and employer state, and high-risk online-application prefixes</li>
+          <li>W-2 Box 14 code validation against the standard payroll code vocabulary (random strings like "OB3QOT" get flagged)</li>
+          <li>Employer-name heuristics: nonsense names, improper capitalization ("yinzer rentals"), and bulk e-filing platform fingerprints with system-generated account numbers</li>
+          <li>Multiple W-2 forms crammed on a single page (multiple EINs/employer blocks)</li>
+          <li>State wages/tax present with a blank Box 15 employer state ID — fabricators rarely know the state registration number</li>
+          <li>Inconsistent date formats, suspicious phrases like "proof of income" that real payroll never prints</li>
+          <li>SSN truncation compliance with IRS Pub. 1586 — full-SSN redaction is treated as candidate privacy protection, not fraud</li>
         </ul>
       </div>
 
       <div class="capability">
         <div class="capability-header">
           <div class="capability-icon">🔍</div>
-          <h3>Visual Forensics</h3>
+          <h3>Visual &amp; Color Forensics</h3>
         </div>
         <p>Cut-and-paste operations leave traces invisible to the naked eye.</p>
         <ul>
-          <li>Resolution, aspect ratio, and color-profile checks</li>
-          <li>Edge artifacts from image compositing</li>
-          <li>Noise pattern inconsistencies in edited regions</li>
-          <li>Standard paper size validation</li>
-          <li>Screenshot-of-a-screenshot detection</li>
+          <li>Resolution, aspect ratio, and color-profile checks; standard paper-size validation</li>
+          <li>Cropped/truncated image detection — extreme aspect ratios that hide part of a form</li>
+          <li>Non-black machine text: real tax documents print in black; blue/red typeset field data is a template-overlay tell — with automatic white-balance correction so a warm-lit phone photo of real black ink doesn't false-positive</li>
+          <li>Bimodal text-darkness patterns — two ink populations on one page means overlaid or pasted text</li>
+          <li>Font-size clustering across value fields (computer-vision backstop, corroboration-gated so clean scans don't trip it)</li>
+          <li>Edge artifacts, noise-pattern inconsistencies, screenshot-of-a-screenshot detection</li>
+          <li>Physical marker/ink redaction recognition — expected candidate privacy behavior, scored accordingly</li>
+          <li>Anomaly compounding: several individually minor oddities on one document escalate together</li>
+        </ul>
+      </div>
+
+      <div class="capability">
+        <div class="capability-header">
+          <div class="capability-icon">🧾</div>
+          <h3>Tax-Form Structure Forensics</h3>
+        </div>
+        <p>The IRS publishes exact form layouts. Fabricated W-2s and 1099s get the structure wrong in ways real payroll software never does.</p>
+        <ul>
+          <li>W-2 Box 12 must be four rows labeled 12a–12d; repeated unlabeled "12/12/12" rows expose a homemade template</li>
+          <li>W-2 Box 13 is one box with three checkboxes — three rows each labeled "13" is a fabrication tell</li>
+          <li>Duplicated or out-of-sequence box numbers vs. the official IRS layout</li>
+          <li>On genuine W-2s/1099s the tax year prints larger and bolder than body text — same-size years suggest a template</li>
+          <li>Form rule-lines crossing or clipping through text, and text colliding with checkboxes or bleeding between fields</li>
+          <li>Missing or inconsistent box borders in the state-tax row</li>
+          <li>Years or amounts overprinted on top of covered content (white/black boxes with new text overlaid)</li>
+        </ul>
+      </div>
+
+      <div class="capability">
+        <div class="capability-header">
+          <div class="capability-icon">🗂️</div>
+          <h3>IRS Transcript Cross-Document Analysis</h3>
+        </div>
+        <p>IRS Wage &amp; Income Transcripts are only released as uneditable PDFs. Re-flowed, edited copies leak structural tells — and comparing a batch exposes what single-document review never sees.</p>
+        <ul>
+          <li>Batch mode: multiple transcripts analyzed together, cross-checked for impossible combinations</li>
+          <li>Duplicate tracking numbers across "separate" transcripts — a smoking gun; genuine packets are one continuous document</li>
+          <li>Same tracking number with different PDF creation times or page dimensions</li>
+          <li>Missing IRS masthead, sensitive-data banner, tracking number, or response date</li>
+          <li>Future-dated request/response dates</li>
+          <li>Truncated system values ("Origin" instead of "Original", "Un" instead of "Unanswered") left behind when a transcript is re-typed into an editable format</li>
+          <li>Replacement footers like "NON-EMPLOYMENT INFORMATION REDACTED" — real IRS output never prints this</li>
+          <li>Employer-name truncation analysis based on the IRS's actual 3–4 character word-group convention — including over-clipped names no IRS system would emit</li>
+          <li>Solid black bars over wage columns detected via pixel-run analysis</li>
         </ul>
       </div>
 
@@ -703,12 +753,16 @@
         </div>
         <p>Diplomas and transcripts are increasingly fabricated — our engine catches the tells.</p>
         <ul>
-          <li>Documented diploma-mill blocklist (GAO / Oregon ODA sources)</li>
-          <li>Transcript GPA reconciliation against listed courses and grades</li>
-          <li>Latin honors thresholds (cum laude ≥ 3.5, magna ≥ 3.7, summa ≥ 3.9)</li>
-          <li>US Dept of Ed recognized accreditor detection (HLC, MSCHE, WSCUC, ABET, LCME…)</li>
-          <li>Legitimate source recognition: Parchment, National Student Clearinghouse, MyCreds, Ellucian Banner, Workday Student</li>
-          <li>Latin/institution-name misspelling detection (“univercity”, “cume laude”, “curriculam”)</li>
+          <li>Documented diploma-mill blocklist — 60+ institutions compiled from GAO reports, the Oregon ODA unaccredited list, and academic-integrity research</li>
+          <li>Diploma-mill language detection: "life experience degree", "no attendance required", "degree in one day", "instant degree", vague "internationally accredited" claims with no named accreditor</li>
+          <li>Transcript GPA reconciliation: cumulative GPA re-computed from every listed course, grade, and credit hour — small drift is tolerated, large gaps escalate</li>
+          <li>Credit-hour audits: stated totals vs. summed course credits, per-course loads outside the US 1–5 norm, statistically improbable all-A transcripts, GPAs beyond the 4.0/4.3 scale</li>
+          <li>Latin honors thresholds (cum laude ≥ 3.5, magna ≥ 3.7, summa ≥ 3.9) cross-checked against the printed GPA</li>
+          <li>Future-dated or implausibly old conferral years; degree names outside standard US nomenclature; diplomas with no identifiable institution</li>
+          <li>US Dept of Ed recognized accreditor detection (HLC, MSCHE, WSCUC, ABET, LCME, AACSB, ABA, CCNE/ACEN…) as a positive signal</li>
+          <li>Legitimate source recognition: Parchment, National Student Clearinghouse, MyCreds, Ellucian Banner, Workday Student, PeopleSoft Campus</li>
+          <li>Credential misspelling blocklist ("univercity", "colledge", "cume laude", "magma cum laude", "curriculam", "diplomma") — real registrars don't misspell their own vocabulary</li>
+          <li>AI vision review of seals (embossed vs. pasted low-res graphic), signatures and titles, course-code consistency, chronological terms with realistic 12–18 credit loads, and Word-template-vs-professional-print quality</li>
         </ul>
       </div>
 
@@ -719,11 +773,12 @@
         </div>
         <p>Fake CPA, PMP, and licensing certs are a growing verification vector.</p>
         <ul>
-          <li>Recognized issuers: AICPA, PMI, ISACA, (ISC)², NCEES, state licensing boards, medical specialty boards, bar associations</li>
-          <li>Credential-number format sanity + placeholder-value detection</li>
-          <li>Issue/expiration date plausibility</li>
-          <li>Detects “lifetime” expirations on credentials that require renewal</li>
-          <li>Fabricated-issuer flagging when the issuing body is unrecognized</li>
+          <li>30+ recognized issuing bodies: AICPA/NASBA, PMI, ISACA, (ISC)², NCEES, SANS/GIAC, CompTIA, AWS/Microsoft/Google/Cisco, SHRM/HRCI, ANCC, NABP, NBCOT, APTA, ASHA, medical specialty boards, state bars and licensing boards</li>
+          <li>Fabricated-issuer flagging — fake certs love vague, invented "institutes" and "boards"</li>
+          <li>Credential-number sanity: too-short IDs, repeated-character and placeholder patterns ("12345", "XXXXX")</li>
+          <li>Expiration plausibility: long-expired credentials, and "lifetime" expirations 20+ years out on credentials that require 1–5 year renewal cycles</li>
+          <li>Credential-vocabulary misspellings ("certfied", "proffesional") that no real issuer prints</li>
+          <li>AI check that the credential title matches a product the issuer actually offers</li>
         </ul>
       </div>
 
@@ -732,15 +787,17 @@
           <div class="capability-icon" style="background: linear-gradient(135deg, #667eea, #764ba2);">🤖</div>
           <h3>AI Vision Analysis (Powered by Claude)</h3>
         </div>
-        <p>What forensic rules can't catch, AI can. Claude examines the document the way an experienced fraud analyst would — looking at the whole picture at once. The prompt is tuned to the doc type: W-2 box layout for tax forms, seal/signature/Latin quality for diplomas.</p>
+        <p>What forensic rules can't catch, AI can. Claude examines the document the way an experienced fraud analyst would — looking at the whole picture at once. The prompt is tuned to the doc type: W-2 box layout and year typography for tax forms, seal/signature/Latin quality for diplomas, issuer conventions for certifications.</p>
         <ul>
-          <li>Font mismatches between sections that shouldn't differ</li>
-          <li>Text that "floats" or is misaligned in ways real payroll systems don't produce</li>
+          <li>Font and font-<em>size</em> mismatches between values that shouldn't differ — a signature tell of edited W-2s</li>
+          <li>Text that "floats", overlaps fields, or is misaligned in ways real payroll systems don't produce</li>
           <li>Logos and institutional seals that appear copied, low-resolution, or overlaid</li>
-          <li>Regions with inconsistent sharpening or blur suggesting local edits</li>
+          <li>Regions with inconsistent sharpening or blur suggesting local edits; rectangles covering original content</li>
           <li>"Too perfect" templated appearances that no real payroll system or registrar produces</li>
-          <li>Education-specific: seal authenticity, signature presence, template-vs-professional print quality</li>
-          <li>Holistic authenticity assessment with confidence score and reasoning</li>
+          <li>Date-aware analysis: today's date is injected into every review, and a deterministic backstop drops any AI "future-date" claim that isn't actually in the future</li>
+          <li>Resilient by design: automatic fallback across current Claude models, so a model retirement can never silently disable the AI layer</li>
+          <li>Guardrailed scoring: an AI "appears legitimate" verdict can never bury a critical structural flag found by the deterministic layers</li>
+          <li>Holistic authenticity assessment with confidence score, key findings, and reasoning</li>
         </ul>
       </div>
     </div>
@@ -763,13 +820,13 @@
       <div class="step">
         <div class="step-number">1</div>
         <h3>Document Upload</h3>
-        <p>Verifier drags in a PDF, PNG, or JPG. The document is processed in memory — never written to persistent storage.</p>
-        <div class="step-detail">Supports Pay Stubs, W-2s, 1099s, Offer Letters, Diplomas &amp; Transcripts.</div>
+        <p>Verifier drags in a PDF, PNG, or JPG. The document is processed in memory — never written to persistent storage. IRS Transcripts support multi-file batch upload for cross-document analysis.</p>
+        <div class="step-detail">Supports Pay Stubs, W-2s, 1099s, IRS Transcripts, Offer Letters, Diplomas, Transcripts &amp; Professional Certifications.</div>
       </div>
       <div class="step">
         <div class="step-number">2</div>
-        <h3>Metadata Extraction</h3>
-        <p>PyMuPDF and image libraries pull creation date, producing software, modification history, and file structure.</p>
+        <h3>Metadata &amp; Page Selection</h3>
+        <p>PyMuPDF and image libraries pull creation date, producing software, modification history, and file structure. Multi-page PDFs are scored page-by-page so the engine analyzes the actual form — not a cover letter stapled in front of it.</p>
         <div class="step-detail">A SHA-256 file hash is generated for audit trail — nothing else is retained.</div>
       </div>
       <div class="step">
@@ -799,7 +856,7 @@
       <div class="step">
         <div class="step-number">7</div>
         <h3>AI Vision Analysis</h3>
-        <p>Claude examines the document holistically and returns an assessment — LIKELY_LEGITIMATE, SUSPICIOUS, or LIKELY_FRAUDULENT — with confidence, key findings, and specific concerns.</p>
+        <p>Claude examines the document holistically and returns an assessment — LIKELY_LEGITIMATE, SUSPICIOUS, or LIKELY_FRAUDULENT — with confidence, key findings, and specific concerns. Deterministic guardrails keep a lenient AI read from overriding hard structural evidence.</p>
         <div class="step-detail">Runs over an encrypted TLS connection. The image is not retained by the AI provider and is not used for model training.</div>
       </div>
       <div class="step">
@@ -807,6 +864,38 @@
         <h3>Risk Scoring &amp; Report</h3>
         <p>All flags are aggregated into a 0–100 risk score with severity levels, plus a recommended action. A professional PDF report can be generated for the customer.</p>
         <div class="step-detail">The uploaded file is deleted from disk. Only the file hash and outcome remain in the audit trail.</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- Field-Hardened -->
+<section class="problem">
+  <div class="container">
+    <div class="section-head">
+      <div class="eyebrow">Field-Hardened</div>
+      <h2>Tuned on real fraud. Disciplined about false positives.</h2>
+      <p class="section-sub">
+        The Detector isn't a demo trained on synthetic samples. It runs inside a working
+        background-check operation, and every rule earns its place against real documents —
+        both fraudulent and legitimate.
+      </p>
+    </div>
+    <div class="problem-grid">
+      <div class="problem-card">
+        <div class="icon">🪤</div>
+        <h3>Patterns Caught in the Wild</h3>
+        <p>Detection rules built from confirmed production fraud: shell-company 1099 networks sharing one address, cover letters stapled in front of doctored W-2s, IRS transcripts re-flowed into editable PDFs, font-size tampering on wage values, blue-typeset template overlays, and future-dated tax forms.</p>
+      </div>
+      <div class="problem-card">
+        <div class="icon">🧪</div>
+        <h3>Every Miss Becomes a Test</h3>
+        <p>When our verification team confirms a document the engine under- or over-scored, the fix ships with a permanent regression test built from that document. The growing suite runs on every change — a rule that catches this month's fraud can't quietly break last month's.</p>
+      </div>
+      <div class="problem-card">
+        <div class="icon">⚖️</div>
+        <h3>Engineered Against False Alarms</h3>
+        <p>A phone photo under warm light isn't "red ink" — the engine white-balances before judging color. A candidate who redacted their SSN isn't a fraudster — privacy redactions are expected and scored as such. Documents from recognized payroll systems, registrars, and issuers earn credit, not just scrutiny.</p>
       </div>
     </div>
   </div>
@@ -905,6 +994,7 @@
       <div class="pill">📄 Pay Stubs</div>
       <div class="pill">📊 W-2 Forms</div>
       <div class="pill">💼 1099 Forms</div>
+      <div class="pill">🏛️ IRS Wage &amp; Income Transcripts (batch)</div>
       <div class="pill">✉️ Offer Letters</div>
     </div>
 
