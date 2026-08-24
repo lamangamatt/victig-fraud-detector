@@ -550,6 +550,53 @@
     .safety-grid { grid-template-columns: 1fr; }
     .nav-links a:not(.nav-cta) { display: none; }
   }
+
+  /* ---------- Print / PDF layout (must come last to beat the mobile breakpoint,
+     since Chrome's print viewport is narrower than 900px) ---------- */
+  @media print {
+    @page { margin: 0.45in 0.35in; }
+    header { display: none; }                 /* sticky nav would repeat on every page */
+    section { padding: 26px 20px !important; }
+    .hero { padding: 30px 20px 26px !important; }
+    .hero h1 { font-size: 32px !important; }
+    h2 { font-size: 26px !important; break-after: avoid-page; page-break-after: avoid; }
+    .section-head { break-inside: avoid; page-break-inside: avoid; break-after: avoid-page; page-break-after: avoid; }
+
+    /* Restore desktop multi-column grids in print */
+    .hero-stats { grid-template-columns: repeat(4, 1fr) !important; gap: 16px !important; }
+    .problem-grid, .scoring-grid { grid-template-columns: repeat(3, 1fr) !important; gap: 14px !important; }
+    .steps-grid { grid-template-columns: repeat(2, 1fr) !important; gap: 14px !important; }
+    .safety-grid { grid-template-columns: repeat(3, 1fr) !important; gap: 14px !important; }
+
+    /* Capability cards: full-width block flow in print. Chrome fragments block
+       layout far more reliably than grid rows with tall cards. */
+    .capabilities-grid { display: block !important; }
+    .capabilities-grid .capability { margin-bottom: 14px; }
+
+    /* Keep atomic blocks on one page */
+    .problem-card, .capability, .step, .risk-card, .safety-card,
+    .hero-stat, .doc-pills, .providers, .cta .container, footer {
+      break-inside: avoid; page-break-inside: avoid;
+    }
+    .capability ul, .step p { orphans: 3; widows: 3; }
+
+    /* Deterministic pagination: two capability cards per page */
+    .capabilities-grid .capability:nth-child(3),
+    .capabilities-grid .capability:nth-child(5),
+    .capabilities-grid .capability:nth-child(7),
+    .capabilities-grid .capability:nth-child(9) {
+      break-before: page; page-break-before: always;
+    }
+    /* Tighten card typography so each pair fits a page */
+    .capability { padding: 16px 20px !important; }
+    .capability p { font-size: 12.5px !important; line-height: 1.5 !important; }
+    .capability li { font-size: 12px !important; line-height: 1.4 !important; margin-bottom: 4px !important; }
+    .capability ul { margin-top: 8px !important; }
+    .capability h3 { font-size: 16px !important; }
+    .capability-header { margin-bottom: 6px !important; }
+    .capability, .problem-card, .step, .safety-card, .risk-card { box-shadow: none !important; }
+    * { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  }
 </style>
 </head>
 <body>
@@ -756,13 +803,13 @@
           <li>Documented diploma-mill blocklist — 60+ institutions compiled from GAO reports, the Oregon ODA unaccredited list, and academic-integrity research</li>
           <li>Diploma-mill language detection: "life experience degree", "no attendance required", "degree in one day", "instant degree", vague "internationally accredited" claims with no named accreditor</li>
           <li>Transcript GPA reconciliation: cumulative GPA re-computed from every listed course, grade, and credit hour — small drift is tolerated, large gaps escalate</li>
-          <li>Credit-hour audits: stated totals vs. summed course credits, per-course loads outside the US 1–5 norm, statistically improbable all-A transcripts, GPAs beyond the 4.0/4.3 scale</li>
+          <li>Credit-hour audits: stated totals vs. summed course credits, per-course loads outside the US norm, improbable all-A transcripts, GPAs beyond the 4.0/4.3 scale</li>
           <li>Latin honors thresholds (cum laude ≥ 3.5, magna ≥ 3.7, summa ≥ 3.9) cross-checked against the printed GPA</li>
           <li>Future-dated or implausibly old conferral years; degree names outside standard US nomenclature; diplomas with no identifiable institution</li>
           <li>US Dept of Ed recognized accreditor detection (HLC, MSCHE, WSCUC, ABET, LCME, AACSB, ABA, CCNE/ACEN…) as a positive signal</li>
           <li>Legitimate source recognition: Parchment, National Student Clearinghouse, MyCreds, Ellucian Banner, Workday Student, PeopleSoft Campus</li>
           <li>Credential misspelling blocklist ("univercity", "colledge", "cume laude", "magma cum laude", "curriculam", "diplomma") — real registrars don't misspell their own vocabulary</li>
-          <li>AI vision review of seals (embossed vs. pasted low-res graphic), signatures and titles, course-code consistency, chronological terms with realistic 12–18 credit loads, and Word-template-vs-professional-print quality</li>
+          <li>AI vision review of seals (embossed vs. pasted), signatures and titles, course-code consistency, realistic semester loads, and template-vs-professional-print quality</li>
         </ul>
       </div>
 
