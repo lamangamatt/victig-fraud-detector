@@ -3556,6 +3556,51 @@ RESPOND IN THIS JSON FORMAT:
 CONTEXT:
 {context}
 
+CRITICAL POLICY - REDACTIONS ARE EXPECTED (READ FIRST):
+
+VICTIG's verifications team instructs applicants to redact sensitive fields
+BEFORE submitting pay stubs, W-2s, and other employment documents. This is
+done for legal-compliance reasons - salary history inquiry bans are active in
+22+ US states and many local jurisdictions, where it is illegal for employers
+or CRAs to verify past income. Redacting wages protects the applicant and
+shields VICTIG and its clients from an unlawful income verification claim.
+
+Because of this policy, black bars / black boxes / white boxes / \"REDACTED\"
+labels covering the following fields are EXPECTED and NORMAL. They are not
+fraud indicators and must NOT be reported in `manipulation_indicators`,
+`visual_consistency.issues`, or `template_authenticity.concerns`:
+
+  * Gross pay / net pay / take-home
+  * Wages / earnings / salary / hourly rate / hours worked
+  * All tax withholdings (federal, state, FICA, Medicare, SDI, SUI)
+  * All deductions (401k, health, dental, vision, HSA, FSA)
+  * All YTD totals
+  * Federal wages (Box 1) / SS wages (Box 3) / Medicare wages (Box 5)
+  * State wages (Box 16) / state income tax (Box 17) / local wages/tax
+  * Bank account numbers / routing numbers
+  * Full SSN / EIN digits (leaving last 4 visible is expected)
+  * Home address / phone / date of birth
+
+Redactions on these fields tell you the applicant followed instructions.
+A fully-redacted-wages paystub is doing exactly what VICTIG asked for.
+
+HOWEVER, redactions on the following fields ARE genuinely suspicious and
+SHOULD be reported (the applicant would have no legitimate reason to hide
+these - they are the verifiable fields we need to confirm employment):
+
+  * Employer name / employer address / employer phone
+  * Employee name (first or last)
+  * Employment dates / hire date / pay period dates / advice date / pay date
+  * Tax year on a W-2/1099
+  * Job title or department (only if paired with other tells)
+
+Rule of thumb: if the redaction hides a NUMBER, it is almost certainly
+compliance-related. If the redaction hides an IDENTITY or DATE that we
+need to verify, that IS a fraud tell.
+
+Separately, report your read of the redaction pattern in `redaction_analysis`
+(see JSON schema below).
+
 ANALYZE FOR:
 
 1. **Font Consistency** (Only flag when combined with other indicators)
@@ -3631,7 +3676,11 @@ ANALYZE FOR:
    - Inconsistent shadows or lighting around text elements?
    - Text that appears to float or not sit naturally on the background?
    - Different quality/resolution in different areas of the document?
-   - White or colored rectangles that might be covering original content?
+   - White or colored rectangles that might be covering original content
+     ** BUT NOT ** if they are covering compliance-redactable fields (wages,
+     taxes, deductions, YTD, bank/PII) as described in the CRITICAL POLICY
+     block above. Those are expected. Only report rectangles covering
+     employer identity, employee identity, or dates.
 
 7. **Box Numbering & Form Structure** (CRITICAL for W-2 / 1099)
    Official IRS forms have a STRICT layout. Deviations are strong fraud indicators.
@@ -3740,7 +3789,13 @@ RESPOND IN THIS JSON FORMAT:
     }},
     "manipulation_indicators": {{
         "detected": true/false,
-        "indicators": ["list of specific indicators: blur, cut lines, rectangles covering text, etc."]
+        "indicators": ["list of specific indicators: blur, cut lines, rectangles covering text, etc. DO NOT list black bars / white boxes / redactions over wages, taxes, deductions, YTD totals, bank/routing/SSN/PII - those are expected per the CRITICAL POLICY block. Only list rectangles that cover employer name/address, employee name, or dates."]
+    }},
+    "redaction_analysis": {{
+        "redactions_present": true/false,
+        "appears_compliance_related": true/false,
+        "fields_redacted": ["list of fields that appear redacted, e.g. 'gross pay', 'YTD taxes', 'bank account number', 'employee name'"],
+        "suspicious_redactions": ["list ONLY redactions on identity/date fields (employer, employee, dates) - leave empty if only wages/taxes/PII are redacted"]
     }},
     "box_numbering_structure": {{
         "valid": true/false,
@@ -3840,6 +3895,62 @@ RESPOND IN THIS JSON FORMAT:
                     'critical',
                     30,
                 )
+
+    def _is_wage_redaction_finding(self, indicator: str) -> bool:
+        """True when an AI manipulation indicator is describing a
+        compliance-related redaction on a wage/tax/PII field, not real
+        digital manipulation.
+
+        VICTIG instructs applicants to redact wages, taxes, deductions, YTD,
+        and PII before submission (salary-history-ban compliance in 22+ US
+        states). The AI vision model often reads a solid black bar over these
+        fields as \"suspicious digital manipulation\" - a critical false
+        positive. This helper suppresses those.
+
+        Suppression rule: the indicator describes a covering/redaction pattern
+        AND references a wage/tax/PII field AND does NOT reference an
+        identity/date field (employer, employee name, dates). If it mentions
+        an identity/date field, we keep the flag - real fraud tell.
+
+        Added 2026-08-27 (Myssy Clayson): Dion George Experis paystubs scored
+        100/100 because black bars over gross/net/YTD were read as \"white or
+        colored rectangles covering original content.\"
+        """
+        text = (indicator or '').lower()
+        # Covering/redaction language
+        covering_terms = (
+            'black bar', 'black box', 'black rectangle', 'black boxes',
+            'black bars', 'white box', 'white rectangle', 'white boxes',
+            'covered', 'covering', 'covers ', 'obscured', 'obscures',
+            'redact', 'blacked out', 'blocked out', 'rectangle', 'rectangles',
+            'concealed', 'hidden', 'masked',
+        )
+        if not any(term in text for term in covering_terms):
+            return False
+        # Identity/date terms - if present, DO NOT suppress
+        identity_terms = (
+            'employer name', 'employer address', 'company name',
+            'employee name', 'applicant name', 'first name', 'last name',
+            'pay period date', 'advice date', 'pay date', 'issue date',
+            'hire date', 'tax year', 'period begin', 'period end',
+        )
+        if any(term in text for term in identity_terms):
+            return False
+        # Wage/tax/PII terms - if present, suppress
+        wage_terms = (
+            'wage', 'wages', 'earning', 'earnings', 'gross', 'net pay',
+            'take-home', 'take home', 'salary', 'hourly', 'hours',
+            'tax', 'taxes', 'withholding', 'withheld', 'fica',
+            'medicare', 'social security', 'sdi', 'sui', 'futa', 'suta',
+            'deduction', 'deductions', '401k', '401(k)', 'hsa', 'fsa',
+            'health', 'dental', 'vision', 'insurance',
+            'ytd', 'year to date', 'year-to-date',
+            'bank', 'routing', 'account number', 'account num',
+            'ssn', 'social security number',
+            'dollar', '$', 'amount', 'amounts', 'figure', 'figures',
+            'value', 'values', 'monetary', 'currency', 'income',
+        )
+        return any(term in text for term in wage_terms)
 
     def _is_false_future_date_claim(self, issue: str) -> bool:
         """True when an AI date-tampering 'issue' is a 'future-dated' claim whose
@@ -3986,15 +4097,59 @@ RESPOND IN THIS JSON FORMAT:
                 )
 
         # Manipulation indicators (blur, cut lines, covered text)
+        # 2026-08-27 (Myssy Clayson): filter out manipulation indicators that
+        # describe compliance-related redactions on wage/tax/PII fields. VICTIG
+        # instructs applicants to redact these BEFORE submitting under salary-
+        # history-ban compliance, so the AI treating a black bar over gross pay
+        # as "suspicious digital manipulation" is a false positive. The AI
+        # prompt was updated to not include these in `manipulation_indicators`,
+        # and this deterministic filter is a belt-and-suspenders backstop.
         mi = ai_result.get('manipulation_indicators', {})
         if mi.get('detected'):
             for indicator in mi.get('indicators', [])[:2]:
+                if self._is_wage_redaction_finding(indicator):
+                    continue
                 self._add_flag(
                     'AI Detected Manipulation',
                     indicator,
                     'critical',
                     15,
                 )
+
+        # 2026-08-27 (Myssy Clayson): honour the AI's `redaction_analysis`
+        # block. If the model reports SUSPICIOUS redactions on identity/date
+        # fields (employer name, employee name, dates), flag as critical. If
+        # all reported redactions are compliance-related, add an info-level
+        # note explaining why they were expected.
+        ra = ai_result.get('redaction_analysis', {})
+        if ra.get('redactions_present'):
+            for sus in (ra.get('suspicious_redactions', []) or [])[:3]:
+                self._add_flag(
+                    'Suspicious Redaction on Identity/Date Field',
+                    f'{sus} Redactions on employer name, employee name, or dates '
+                    f'are not part of the compliance-redaction policy (which '
+                    f'covers wages, taxes, and PII only). Verify why these '
+                    f'identity/date fields are obscured.',
+                    'critical',
+                    30,
+                )
+            if ra.get('appears_compliance_related') and doc_type in ('Pay Stub', 'W-2', '1099'):
+                fields = ra.get('fields_redacted', []) or []
+                already = any(f.get('title') == 'Wage/PII Redactions - Compliance Context'
+                              for f in self.flags)
+                if not already:
+                    detail = ', '.join(fields[:5]) if fields else 'wage and PII fields'
+                    self._add_flag(
+                        'Wage/PII Redactions - Compliance Context',
+                        f'Document has redactions on {detail}. VICTIG asks '
+                        f'applicants to redact wages/taxes/PII before submission '
+                        f'for salary-history-ban compliance (22+ states). '
+                        f'These redactions are expected. Verify employment '
+                        f'using employer name, employee name, and pay period '
+                        f'dates, which should still be visible.',
+                        'info',
+                        0,
+                    )
 
         # Box numbering / structural (v2.3)
         box_check = ai_result.get('box_numbering_structure', {})

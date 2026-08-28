@@ -706,3 +706,115 @@ These are arguably a *third* class of false positive — the tool conflates
 read as fraud?) and was left for Matt to decide.
 
 *Changes implemented by Molesley, 2026-08-19*
+
+---
+
+## 2026-08-27 — Wage Redactions Falsely Read as Fraud (Dion George / Experis)
+
+**Reporter:** Myssy Clayson. **Sample:** Two Experis/ManpowerGroup paystubs
+for Dion George (Cisco Systems assignment) where every dollar amount —
+gross, net, all taxes, all YTD, all deductions — was covered with solid
+black bars. Employer, employee name, and pay period dates were clearly
+visible. Production scored the stubs 100/100 HIGH RISK.
+
+**Myssy's push-back** (very legitimate): VICTIG instructs applicants to
+redact wages before submission for salary-history-ban compliance (22+ US
+states + numerous local jurisdictions). Redactions on wages/taxes/deductions
+protect the applicant and shield VICTIG/clients from an unlawful income
+verification claim. Her ask: can the detector be updated so wage/earnings
+redactions don't trigger critical flags?
+
+### Root Cause
+
+The AI vision prompt treated any "white or colored rectangles covering
+original content" as a manipulation indicator with no exception for
+compliance-redactable fields. `_apply_employment_ai_flags` then turned
+each into an "AI Detected Manipulation" critical +15 flag. Two of those
+(plus the AI's `overall_assessment` shifting to LIKELY_FRAUDULENT which
+dragged other subscores up) pushed the stubs to 100/100.
+
+The 2026-08-19 note explicitly deferred this class of issue to Matt as a
+policy call ("should a fully-redacted paystub ESCALATE for an unredacted
+copy rather than read as fraud?"). Matt's call, delivered 2026-08-27: fix
+the detector, and follow Myssy's tiered model.
+
+### The Tiered Model (committed to Myssy 2026-08-27)
+
+- **PII redactions** (bank / routing / SSN / address) → don't flag
+- **Wage / earnings / YTD / tax / deduction redactions** → don't flag
+  critical (salary-history-ban compliance) — info-level note at most
+- **Employer name / employee name / dates / tax year redactions** → still
+  critical (those are the fields we're actually verifying)
+
+### Changes (document_analyzer.py + test_myssy_2026_08_27.py)
+
+**A. AI PROMPT** — added a `CRITICAL POLICY - REDACTIONS ARE EXPECTED`
+   block at the top of `_build_employment_ai_prompt`, before `ANALYZE FOR`.
+   Enumerates every compliance-redactable field (wages, taxes, deductions,
+   YTD, bank/PII) and explicitly tells the model NOT to list them in
+   `manipulation_indicators`, `visual_consistency.issues`, or
+   `template_authenticity.concerns`. Separately enumerates the identity/date
+   fields the model SHOULD still flag if redacted (employer name, employee
+   name, dates, tax year). Also refined the item-6 wording to reinforce
+   the same rule.
+
+**B. NEW `redaction_analysis` JSON FIELD** in the AI response schema:
+   ```
+   "redaction_analysis": {
+       "redactions_present": bool,
+       "appears_compliance_related": bool,
+       "fields_redacted": [str],
+       "suspicious_redactions": [str],  // identity/date only
+   }
+   ```
+
+**C. NEW `_is_wage_redaction_finding(indicator)` HELPER** — deterministic
+   belt-and-suspenders backstop. Classifies an AI manipulation indicator
+   as compliance-related when it contains covering/redaction language
+   (`black bar`, `blacked out`, `covered`, `rectangle`, `obscured`, etc.)
+   AND references a wage/tax/PII field, AND does NOT reference an
+   identity/date field. Applied inside `_apply_employment_ai_flags` to
+   drop such indicators before they become flags.
+
+**D. NEW HANDLING in `_apply_employment_ai_flags`:**
+   - Filter manipulation indicators through the helper above (compliance
+     redactions dropped, real manipulation and identity-covering redactions
+     kept).
+   - If AI reports `redaction_analysis.suspicious_redactions`, add a
+     critical "Suspicious Redaction on Identity/Date Field" (+30) per item.
+   - If AI reports `appears_compliance_related=True` on Pay Stub / W-2 /
+     1099, add an info-level "Wage/PII Redactions — Compliance Context"
+     flag (+0). Explains why the redactions were expected and reminds
+     reviewers to verify employment via employer name, employee name,
+     and pay period dates.
+
+**E. REGRESSION TEST** `test_myssy_2026_08_27.py` — 22-case classification
+   test for the helper, 3-case AI-flag pipeline test (pure wage redaction
+   → suppressed + compliance context added; real blur/cut-paste
+   manipulation → still fires; identity/date redaction → critical fires),
+   prompt-audit test, and end-to-end deterministic-baseline test against
+   the two Dion George stubs.
+
+### Scope Guardrails (unchanged)
+
+- IRS Wage & Income Transcripts still flag wage redaction bars (the IRS
+  never redacts wages, so a black bar there is still a fabrication tell).
+- W-2 math checks, box structure, template authenticity, font-size
+  inconsistency, date tampering, line-clipping, box borders — all still
+  fire normally.
+- Bank/SSN/PII text redactions still route through
+  `_detect_redactions`/`_detect_visual_redactions` unchanged.
+- Suspicious redactions on employer/employee/date fields still fire
+  critical (+30 via the new `Suspicious Redaction on Identity/Date Field`).
+
+### Result
+
+- Baseline (AI off) on Dion George stubs: LOW/20 and MEDIUM/40. Neither
+  is HIGH.
+- All 11 prior Myssy regression tests still PASS (07-03, 07-07, 07-08,
+  07-13, 08-07, 08-12, 08-13, 08-18, 08-19, 08-21, 08-27).
+- End-to-end with AI enabled should score paystubs on their actual
+  substance (font, dates, structure, math) rather than penalize
+  compliance-motivated redactions.
+
+*Changes implemented by Molesley, 2026-08-27*
