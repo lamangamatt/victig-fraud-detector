@@ -1,5 +1,5 @@
 """
-VICTIG Document Fraud Detector v2.0
+VICTIG Document Fraud Detector v2.0.1
 Enhanced with AI Vision Analysis
 """
 
@@ -282,7 +282,7 @@ if page == "📖 About & Methodology":
     """)
     
     st.divider()
-    st.caption("VICTIG Document Fraud Detector v2.0 | For internal use only")
+    st.caption("VICTIG Document Fraud Detector v2.0.1 | For internal use only")
     st.stop()
 
 # Main content - Analyze Document page
@@ -960,7 +960,7 @@ RECOMMENDATIONS
 st.divider()
 col1, col2, col3 = st.columns(3)
 with col1:
-    st.caption("VICTIG Document Fraud Detector v2.0")
+    st.caption("VICTIG Document Fraud Detector v2.0.1")
 with col2:
     st.caption("🔒 For internal use only")
 with col3:
