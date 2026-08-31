@@ -1,16 +1,27 @@
+# VICTIG Fraud Detector — pinned dependencies
+#
+# All versions pinned to exact known-good releases as of 2026-08-31, after
+# the second Streamlit Cloud runtime crash in a week. Unpinned `>=`
+# dependencies were letting Streamlit Cloud silently upgrade packages on
+# container rebuilds — a suspected contributor to the outages.
+#
+# Bump these deliberately: update, run `python3 test_myssy_*.py` locally,
+# push. CI (.github/workflows/ci.yml) will re-run the full Myssy
+# regression suite on every push and block main if anything breaks.
+
 # Core
-streamlit>=1.30.0
-Pillow>=10.0.0
+streamlit==1.50.0
+Pillow==11.3.0
 
 # PDF Processing
-PyMuPDF>=1.23.0
-fpdf2>=2.7.0
+PyMuPDF==1.26.5
+fpdf2==2.8.4
 
 # OCR (optional but recommended)
-pytesseract>=0.3.10
+pytesseract==0.3.13
 
 # AI Analysis (optional)
-anthropic>=0.18.0
+anthropic==0.121.0
 
 # Additional utilities
-python-dateutil>=2.8.0
+python-dateutil==2.9.0.post0
