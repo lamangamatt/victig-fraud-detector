@@ -203,6 +203,26 @@ class DocumentAnalyzer:
         'HEALTH', 'INSURANCE', 'PARKING', 'TRANSIT', 'EDUC', 'TUITION',
         'ROTH', 'SIMPLE', 'SEP', 'ERISA',
     }
+
+    # State/local Box 14 codes commonly seen on employer-issued W-2s.
+    # 2026-09-02 (Myssy Clayson, file 2745525): the AI vision model misread
+    # an ADP W-2 Box 14 "51.11 QOC" as "G1-1 GOC" and flagged it as
+    # placeholder text. Widening the known-code list plus updating the AI
+    # prompt and post-processing filter (see _looks_like_multi_copy_false_positive)
+    # is the belt-and-suspenders backstop.
+    KNOWN_BOX14_CODES = KNOWN_BOX14_CODES | {
+        # New York (very common on ADP-issued NY W-2s)
+        'QOC', 'NYPSL', 'NYPSL-E', 'NYSDI', 'NYSDI-E', 'NYPFL', 'NYPFL-E',
+        'PFL', 'SDI', 'PSL', 'DBL',
+        # California
+        'CASDI', 'CASDI-E', 'CA-SDI', 'CAPFL',
+        # New Jersey / Rhode Island / Washington / Massachusetts / Oregon
+        'NJSDI', 'NJFLI', 'NJSUI', 'RISDI', 'RITDI', 'WAPFML', 'MAPFML',
+        'ORPFML', 'ORSTT', 'ORSTTW',
+        # Miscellaneous common employer codes
+        'IMP', 'IMPLIFE', 'GTL', 'GTLI', 'MOVING', 'RELO', 'SICK',
+        'PTO', 'HOLIDAY', 'BONUS', 'COMM', 'ESPP', 'RSU', 'CLERGY',
+    }
     
     # AI-related indicators - highest risk
     AI_INDICATORS = [
@@ -414,6 +434,10 @@ class DocumentAnalyzer:
         self.redactions_detected = False
         self.redaction_tool_used = None
         self._metadata = {}
+        # 2026-09-02: multi-copy ADP layout detection is set below once text
+        # is available; keep a per-analyze default so stale state from a
+        # previous run cannot leak in.
+        self._is_multi_copy_layout = False
         
         results = {
             'file_path': file_path,
@@ -458,6 +482,18 @@ class DocumentAnalyzer:
         # This sets self.redactions_detected which affects how we score editing tools
         if text:
             self._detect_redactions(text)
+
+        # 2026-09-02 (Myssy Clayson, file 2745525): detect multi-copy ADP
+        # W-2 layouts (Copy B / Copy C / Copy 2 side-by-side with FOLD AND
+        # DETACH HERE perforation lines) BEFORE AI vision runs, so the
+        # AI-flag post-processor can suppress the known-false-positive
+        # patterns (Box 12/13 structural claims, perforation-line "clipping",
+        # "identical across copies" template-reuse claims, "text overlaid on
+        # template"). Deterministic checks — font-size, ink-bimodal, math,
+        # EIN, decimal formatting — still fire independently and will catch
+        # actual forgeries.
+        if doc_type == 'W-2' and text:
+            self._is_multi_copy_layout = self._is_adp_multi_copy_layout(text)
         
         # Run all checks
         self._check_metadata_flags(results['metadata'])
@@ -3601,6 +3637,63 @@ need to verify, that IS a fraud tell.
 Separately, report your read of the redaction pattern in `redaction_analysis`
 (see JSON schema below).
 
+CRITICAL POLICY - MULTI-COPY W-2 LAYOUTS ARE EXPECTED (READ SECOND):
+
+ADP, Paychex, and IRS-published W-2s are frequently printed as MULTI-COPY
+layouts: multiple full copies of the same W-2 (Copy B for federal filing,
+Copy 2 for state filing, Copy C for employee records, sometimes a second
+Copy 2 for city/local) are printed SIDE-BY-SIDE on ONE sheet, separated
+by dashed "FOLD AND DETACH HERE" perforation lines. A stub-style
+"Employee Reference Copy" / "Earnings Summary" often appears at the top.
+
+You will see this layout on almost every ADP-issued W-2. Recognize it and
+DO NOT flag these standard features as fraud:
+
+  * "FOLD AND DETACH HERE" dashed/perforated lines between copies are
+    LEGITIMATE form features. They are NOT "form lines crossing text",
+    "manipulation", or "overlay evidence". Do NOT list them in
+    `lines_crossing_text.issues` or `manipulation_indicators`.
+  * IDENTICAL values across Copy B, Copy 2, Copy C, etc. are REQUIRED
+    by the IRS - all copies of the same W-2 must show the same figures.
+    Matching values across copies are NOT "template reuse", NOT "identical
+    placeholder text", and NOT evidence of fabrication. Do NOT list them
+    in `invalid_field_values.issues`. Only flag if values across copies
+    are INCONSISTENT (which WOULD be a real fraud tell).
+  * ADP compact multi-copy layouts render Box 12 (a/b/c/d) and Box 13
+    (three checkboxes) in TIGHTLY STACKED cells with VERY SMALL suffix
+    letters and label text. This can look, at photo resolution, like
+    "four rows all labeled 12" or "three rows all labeled 13" - it is
+    almost always the compact rendering, NOT a structural fabrication.
+    Only flag Box 12/13 structure as "missing letter suffixes" or
+    "three rows without suffixes" if you can CLEARLY READ that the
+    suffixes are absent (not just faint/small/tightly-spaced).
+  * Compact cells can also make small text (Box 14 codes, state codes in
+    Box 15, small dollar amounts in Box 12) look "clipped" at the top or
+    bottom border on a photographed W-2 - this is USUALLY tight rendering,
+    NOT overlay evidence. Only report clipping when the truncation is
+    unambiguous and reproducible across multiple characters in the same
+    field.
+  * NY W-2s commonly carry Box 14 codes like QOC (Qualified Other
+    Comp), NYPSL / NYPSL-E (NY Paid Sick Leave), NYSDI / NYSDI-E (NY
+    State Disability), NYPFL / NYPFL-E (NY Paid Family Leave). These
+    are LEGITIMATE state codes - not "placeholder text" or template
+    residue. Other legitimate state codes include CASDI (California),
+    NJSDI/NJFLI (New Jersey), RISDI (Rhode Island), WAPFML (Washington),
+    MAPFML (Massachusetts), ORPFML (Oregon). If a Box 14 code is
+    unfamiliar, treat it as an EMPLOYER-DEFINED code, not fraud, unless
+    other tells corroborate.
+
+Rule of thumb for multi-copy layouts: the ONLY multi-copy specific tell
+is INCONSISTENT values ACROSS the copies (Box 1 says $50k on Copy B but
+$60k on Copy 2, for example) or CROSSED-OUT / OVERWRITTEN values inside
+one copy while the others are clean. Matching values, "FOLD AND DETACH
+HERE" perforation lines, and compact 12a-12d/13 cells are all part of
+the standard print - never flag them.
+
+Font-size inconsistency, ink-bimodal, wrong tax year styling, math
+errors, invalid EIN, and missing decimal formatting continue to apply
+normally on multi-copy layouts. Report those if you actually see them.
+
 ANALYZE FOR:
 
 1. **Font Consistency** (Only flag when combined with other indicators)
@@ -4010,6 +4103,8 @@ RESPOND IN THIS JSON FORMAT:
 
     def _apply_employment_ai_flags(self, ai_result: Dict, doc_type: str) -> None:
         """Turn employment / tax-document AI JSON into fraud flags."""
+        is_multi_copy = getattr(self, '_is_multi_copy_layout', False)
+
         # Font consistency - only flag when AI provided corroborating indicators.
         # (Per Trish Gustin feedback June 2026: scanning/photocopying naturally
         # produces font variation; flag only when other fraud signals support it.)
@@ -4086,9 +4181,17 @@ RESPOND IN THIS JSON FORMAT:
             )
 
         # Invalid field values (N/A in numeric fields, etc.)
+        # 2026-09-02 (Myssy Clayson, file 2745525): on multi-copy ADP W-2
+        # layouts, drop AI "placeholder/template text" claims (typically an
+        # OCR/vision misread of a legit small-font Box 14 code like QOC) and
+        # "identical values across copies" claims (matching values across
+        # Copy B / Copy 2 / Copy C are REQUIRED, not template reuse).
         invalid_check = ai_result.get('invalid_field_values', {})
         if invalid_check.get('detected'):
             for issue in invalid_check.get('issues', [])[:2]:
+                if is_multi_copy and self._looks_like_multi_copy_false_positive(issue, 'invalid_value'):
+                    self._note_multi_copy_suppression(issue, 'Invalid Field Value (AI)')
+                    continue
                 self._add_flag(
                     'Invalid Field Value (AI)',
                     issue,
@@ -4108,6 +4211,16 @@ RESPOND IN THIS JSON FORMAT:
         if mi.get('detected'):
             for indicator in mi.get('indicators', [])[:2]:
                 if self._is_wage_redaction_finding(indicator):
+                    continue
+                # 2026-09-02: on multi-copy ADP layouts, "text overlaid on
+                # template" and "text clipping at cell boundaries" are the
+                # exact AI-vision false-positive pattern (the compact 12a-12d
+                # cells and small state row look tight and clipped to the
+                # model). Real overlay/manipulation would corroborate with
+                # font-size inconsistency or ink-bimodal flags, which fire
+                # independently.
+                if is_multi_copy and self._looks_like_multi_copy_false_positive(indicator, 'manipulation'):
+                    self._note_multi_copy_suppression(indicator, 'AI Detected Manipulation')
                     continue
                 self._add_flag(
                     'AI Detected Manipulation',
@@ -4155,6 +4268,17 @@ RESPOND IN THIS JSON FORMAT:
         box_check = ai_result.get('box_numbering_structure', {})
         if box_check.get('valid') is False:
             for issue in box_check.get('issues', [])[:3]:
+                # 2026-09-02: on multi-copy ADP layouts, drop AI claims that
+                # "Box 12 has four rows without a/b/c/d suffixes" or "Box 13
+                # has three separate rows". Genuine multi-copy ADP forms have
+                # tightly stacked 12a-12d cells with tiny suffix letters and a
+                # single Box 13 with three checkboxes; the AI misreads the
+                # compact layout as unlabeled rows. Deterministic checks
+                # (font-size, ink-bimodal, math, EIN, decimal formatting)
+                # still fire independently if the form is actually forged.
+                if is_multi_copy and self._looks_like_multi_copy_false_positive(issue, 'box_structure'):
+                    self._note_multi_copy_suppression(issue, 'Invalid Box Numbering / Structure')
+                    continue
                 self._add_flag(
                     'Invalid Box Numbering / Structure',
                     f'{issue} Official IRS forms have a strict box layout; deviations strongly suggest fabrication or template editing.',
@@ -4177,6 +4301,14 @@ RESPOND IN THIS JSON FORMAT:
         lines_check = ai_result.get('lines_crossing_text', {})
         if lines_check.get('detected'):
             for issue in lines_check.get('issues', [])[:3]:
+                # 2026-09-02: on multi-copy ADP layouts, "FOLD AND DETACH
+                # HERE" perforation lines between copies are legitimate form
+                # features and the compact-cell "clipping" claims are OCR
+                # artifacts. Drop those specific patterns; keep real
+                # line-through-text findings.
+                if is_multi_copy and self._looks_like_multi_copy_false_positive(issue, 'lines_crossing'):
+                    self._note_multi_copy_suppression(issue, 'Form Line Crosses Through Text')
+                    continue
                 self._add_flag(
                     'Form Line Crosses Through Text',
                     f'{issue} Form lines or perforation marks cutting through characters strongly suggest the text was overlaid on top of the form image rather than rendered by a payroll system.',
@@ -4194,6 +4326,163 @@ RESPOND IN THIS JSON FORMAT:
                     'warning',
                     20,
                 )
+
+    # -------------------------------------------------------------------
+    # 2026-09-02 (Myssy Clayson, file 2745525): multi-copy ADP W-2 layout
+    # awareness. See improvements_from_myssy.md for the full context.
+    # -------------------------------------------------------------------
+
+    def _is_adp_multi_copy_layout(self, text: str) -> bool:
+        """Detect legitimate multi-copy ADP / IRS W-2 layouts.
+
+        Multi-copy layouts print multiple copies of the same W-2 side-by-side
+        on one sheet (Copy B / Copy C / Copy 2 / etc.), separated by
+        ``FOLD AND DETACH HERE`` perforation lines. These are the standard
+        ADP, Paychex, and IRS-published layouts; they are NOT fraud.
+
+        Detection is deliberately conservative so it does not accidentally
+        suppress critical flags on a non-multi-copy forgery that happens to
+        say "Copy B" once in a header line:
+
+        - ``FOLD AND DETACH HERE`` alone is sufficient. This phrase is
+          virtually never present outside genuine multi-copy prints.
+        - Otherwise, require 2+ corroborating signals.
+        """
+        if not text:
+            return False
+
+        # Strong signal — alone is sufficient
+        if re.search(r'fold\s+and\s+detach\s+here', text, re.IGNORECASE):
+            return True
+
+        text_lower = text.lower()
+        signals = 0
+
+        # Multiple distinct Copy markers (Copy B, Copy C, Copy 2, etc.)
+        copy_markers = re.findall(r'Cop[yi]\s*([ABCD12])\b', text, re.IGNORECASE)
+        if len({c.upper() for c in copy_markers}) >= 2:
+            signals += 1
+
+        # ADP branding
+        if re.search(r'(?:©|\(c\))\s*\d{0,4}\s*ADP\b', text, re.IGNORECASE):
+            signals += 1
+        if 'adp, inc' in text_lower or 'adp inc.' in text_lower:
+            signals += 1
+        if 'w-2 and earnings summary' in text_lower or 'w-2 & earnings summary' in text_lower:
+            signals += 1
+
+        # Reference copy phrases
+        if 'reference copy' in text_lower or 'employee reference copy' in text_lower:
+            signals += 1
+
+        # "Copies B, C, and 2" boilerplate
+        if re.search(r'Copies\s+[ABCD0-9,\s]+and\s+[ABCD0-9]', text, re.IGNORECASE):
+            signals += 1
+
+        # Multi-copy filing narrative (Federal + State income tax return blurb
+        # printed on Copy B and Copy 2 respectively).
+        if 'federal income tax return' in text_lower and 'state income tax return' in text_lower:
+            signals += 1
+
+        return signals >= 2
+
+    # Known false-positive patterns the AI vision model produces on
+    # legitimate multi-copy W-2 layouts. Each pattern maps to a flag kind
+    # so the caller can drop only the specific misread, not blanket-drop
+    # every AI critical flag.
+    _MULTI_COPY_FP_PATTERNS = {
+        'box_structure': [
+            # "Box 12 shows four rows all labeled '12' without a/b/c/d suffixes"
+            re.compile(r'box\s*12[^\n]*?(?:without|no|missing|not\s+properly)[^\n]{0,40}(?:a/b/c|suffix|letter)', re.IGNORECASE),
+            # "Box 13 shows three separate rows all labeled '13'"
+            re.compile(r'(?:three|3)[^\n]{0,30}(?:row|separate)[^\n]{0,30}(?:labeled|labelled)?[^\n]{0,10}[\'"]?13[\'"]?', re.IGNORECASE),
+            # "Box 12 four rows all labeled 12"
+            re.compile(r'(?:four|4)[^\n]{0,30}(?:row|entr)[^\n]{0,30}(?:labeled|labelled|all)[^\n]{0,10}[\'"]?12[\'"]?', re.IGNORECASE),
+            # Model characterizes the compact layout as fabricated-template pattern
+            re.compile(r'characteristic\s+of\s+fraudulent\s+w[-\s]?2\s+templates?', re.IGNORECASE),
+            re.compile(r'\bmalformed\b[^\n]{0,80}\bbox\s*1[234]\b', re.IGNORECASE),
+            re.compile(r'\bbox\s*1[234]\b[^\n]{0,80}\bmalformed\b', re.IGNORECASE),
+            re.compile(r'never\s+occur\s+on\s+legitimate\s+payroll', re.IGNORECASE),
+        ],
+        'lines_crossing': [
+            # Perforation / fold-detach language — these lines are legit
+            re.compile(r'perforat', re.IGNORECASE),
+            re.compile(r'fold\s*and\s*detach', re.IGNORECASE),
+            re.compile(r'dashed[^\n]{0,40}(?:between|separat)[^\n]{0,30}cop', re.IGNORECASE),
+            # "Top clipping" / "bottom clipping" / "shaved off" — compact
+            # multi-copy cells legitimately look tight to a vision model
+            re.compile(r'(?:top|bottom)\s+clipp', re.IGNORECASE),
+            re.compile(r'shaved\s+off', re.IGNORECASE),
+            re.compile(r'clipp(?:ed|ing)\s+(?:at\s+)?(?:cell|box)\s+(?:top|bottom|boundar)', re.IGNORECASE),
+            re.compile(r'truncated/shaved', re.IGNORECASE),
+            re.compile(r'character\s+clipping\s+at\s+cell', re.IGNORECASE),
+        ],
+        'manipulation': [
+            # Text overlaid on template — classic compact-layout misread
+            re.compile(r'overlaid\s+on', re.IGNORECASE),
+            re.compile(r'values\s+were\s+overlaid', re.IGNORECASE),
+            re.compile(r'text\s+(?:was\s+)?overlaid', re.IGNORECASE),
+            re.compile(r'text\s+clipp(?:ed|ing)\s+at\s+cell', re.IGNORECASE),
+            # "Box border inconsistencies suggest selective editing"
+            re.compile(r'border\s+inconsistenc[^\n]{0,60}(?:selective|editing|edit)', re.IGNORECASE),
+            # "Multi-stage document assembly"
+            re.compile(r'multi[-\s]?stage\s+document\s+assembly', re.IGNORECASE),
+        ],
+        'invalid_value': [
+            # "Box 14 contains 'X' which appears to be placeholder/template text"
+            re.compile(r'\bplaceholder\b', re.IGNORECASE),
+            re.compile(r'template\s+text', re.IGNORECASE),
+            re.compile(r'template\s+reuse', re.IGNORECASE),
+            # "Multiple instances of identical X across all three copies"
+            re.compile(r'(?:identical|matching|same|multiple\s+instances)[^\n]{0,60}(?:copies|copy)', re.IGNORECASE),
+            re.compile(r'across\s+all\s+(?:three|3|two|2)\s+copies', re.IGNORECASE),
+        ],
+    }
+
+    def _looks_like_multi_copy_false_positive(self, issue_text: str, flag_kind: str) -> bool:
+        """Return True if the AI issue text matches a known false-positive
+        pattern on legitimate multi-copy W-2 layouts.
+
+        Caller must gate on ``self._is_multi_copy_layout`` before invoking.
+        """
+        if not issue_text:
+            return False
+        patterns = self._MULTI_COPY_FP_PATTERNS.get(flag_kind, [])
+        return any(p.search(issue_text) for p in patterns)
+
+    def _note_multi_copy_suppression(self, issue_text: str, original_title: str) -> None:
+        """Add a single audit-trail info flag when AI false positives were
+        suppressed on a legitimate multi-copy W-2 layout.
+
+        Also stashes the suppressed issue text on the flag's description so
+        reviewers can see exactly what was dropped.
+        """
+        note_title = 'ADP Multi-Copy W-2 Layout Detected'
+        existing = next((f for f in self.flags if f.get('title') == note_title), None)
+        entry = f'{original_title}: {issue_text[:180]}'
+        if existing:
+            desc = existing.get('description', '')
+            if entry not in desc:
+                existing['description'] = desc + f'\n  • {entry}'
+            return
+        self._add_flag(
+            note_title,
+            (
+                'Document is a legitimate multi-copy W-2 print '
+                '(e.g. ADP Copy B / Copy 2 / Copy C side-by-side with '
+                '"FOLD AND DETACH HERE" perforation lines). AI-vision '
+                'structural flags known to false-positive on compact '
+                'multi-copy layouts have been suppressed (Box 12/13 '
+                'structure, perforation-line "clipping", "overlaid on '
+                'template", identical values across copies). Deterministic '
+                'checks (math, EIN, decimal formatting, font-size, '
+                'ink-bimodal) still apply — if the form is actually forged, '
+                'those fire independently.\n\nSuppressed AI findings:\n'
+                f'  • {entry}'
+            ),
+            'info',
+            0,
+        )
 
     def _generate_recommendations(self, results: Dict) -> List[str]:
         """Generate actionable recommendations based on analysis."""

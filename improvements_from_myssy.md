@@ -818,3 +818,152 @@ the detector, and follow Myssy's tiered model.
   compliance-motivated redactions.
 
 *Changes implemented by Molesley, 2026-08-27*
+
+## 2026-09-02 — ADP Multi-Copy W-2 False Positives (Myssy Clayson, file 2745525)
+
+**Reporter:** Myssy Clayson (VICTIG Verifications). **Trigger email:** 2026-09-02
+"Another Possible False Positive Due To Format Issues File 2745525". Team-wide
+observation: "nearly every W-2 is being flagged as high risk" after the 2026-08-31
+redeploy. Her ask: "Can the system's sensitivity thresholds be adjusted?"
+
+**Sample:** ADP-issued 2025 W-2 for BRITTANY B BENNETT / ST JOHNS RIVERSIDE
+HOSPITAL, printed as a multi-copy sheet — top: Employee Reference / Earnings
+Summary + Copy C; bottom row: Copy B (federal) / Copy 2 (state) / Copy 2
+(city/local) side-by-side, separated by "FOLD AND DETACH HERE" perforation
+lines. Box 14 carried "51.11 QOC" (a legitimate NY Qualified Other Comp code).
+The detector scored 100/100 with 10 critical flags.
+
+### Root Cause — Four Distinct AI Vision Misreads
+
+1. **Compact 12a/12b/12c/12d cells misread as "four rows without suffixes."**
+   ADP compact multi-copy layouts stack 12a-12d with very small suffix letters.
+   The AI vision model read the compact stack as "Box 12 shows four rows all
+   labeled '12' without a/b/c/d suffixes" — the exact language of a real fraud
+   tell — and fired critical +35.
+
+2. **Single Box 13 with three checkboxes misread as "three separate rows."**
+   Same failure mode: compact rendering of Box 13's Statutory-employee /
+   Retirement-plan / Third-party sick-pay checkboxes was read as three rows
+   labeled 13, another critical +35.
+
+3. **"FOLD AND DETACH HERE" perforation lines flagged as "form lines crossing
+   text."** The dashed vertical perforation lines separating Copy B / Copy 2
+   / Copy 2 legitimately run near cell borders; AI treated them as
+   overlay evidence. Also fired on "top clipping" / "bottom clipping" claims
+   for compact Box 14, Box 12, and Box 15 cells — tight rendering read as
+   character shaving. Three critical +30 flags.
+
+4. **Box 14 "51.11 QOC" OCR'd as "G1-1 GOC" → flagged as placeholder text.**
+   AI then compounded it with "identical G1-1 GOC across all three copies
+   suggests template reuse" — which is EXPECTED on multi-copy layouts where
+   every copy MUST show the same values. Two more critical +30 flags.
+
+5. **"Text clipping at cell boundaries indicates values overlaid on template"
+   and "box border inconsistencies suggest selective editing"** — same compact
+   layout, same misread as manipulation. Two critical +15 flags.
+
+**Total: 10 critical false-positive flags, all traceable to the compact
+multi-copy layout confusing the vision model. On a real forged W-2 the
+existing font-size / ink-bimodal / math / EIN / decimal-formatting checks
+would still fire independently.**
+
+### Fix — Deterministic ADP Multi-Copy Awareness
+
+**A. NEW `_is_adp_multi_copy_layout(text)` HELPER.** Conservative detector:
+
+- Strong single signal: `FOLD AND DETACH HERE` (this phrase is virtually
+  never present outside genuine multi-copy prints) → return True.
+- Otherwise require 2+ corroborating signals: multiple distinct Copy
+  markers (Copy B/C/2), ADP branding (`© ADP` / `ADP, Inc.`), "W-2 and
+  Earnings Summary" title, "Reference Copy" phrasing, "Copies B, C, and 2"
+  boilerplate, or the federal+state filing narrative.
+
+Called once in `analyze()` after OCR text extraction, before the AI vision
+call, and stashed on `self._is_multi_copy_layout`.
+
+**B. NEW `_looks_like_multi_copy_false_positive(issue_text, flag_kind)`
+CLASSIFIER.** Regex patterns for the four flag kinds and the specific
+false-positive language the AI produced on file 2745525:
+
+- `box_structure` — "four rows without a/b/c/d suffixes", "three separate
+  rows labeled 13", "characteristic of fraudulent W-2 templates", "would
+  never occur on legitimate payroll", `malformed box 1[234]`.
+- `lines_crossing` — `perforat`, `fold and detach`, `dashed line between
+  copies`, `top clipping`, `bottom clipping`, `shaved off`, `truncated`,
+  `character clipping at cell`.
+- `manipulation` — `overlaid on`, `text overlaid`, `text clipping at cell`,
+  `border inconsistencies (?:selective|editing)`, `multi-stage document
+  assembly`.
+- `invalid_value` — `placeholder`, `template text`, `template reuse`,
+  `identical/matching/same across copies`, `across all three copies`.
+
+**C. `_apply_employment_ai_flags` FILTERS EACH OF THE FOUR CRITICAL FLAG
+BLOCKS** on multi-copy layouts:
+
+- `invalid_field_values` → drop matching patterns
+- `manipulation_indicators` → drop matching patterns (after existing
+  wage-redaction filter)
+- `box_numbering_structure` → drop matching patterns
+- `lines_crossing_text` → drop matching patterns
+
+Every dropped finding is stored on a single audit-trail info flag
+"ADP Multi-Copy W-2 Layout Detected" (severity=info, score=0) with the
+full suppressed text so a reviewer can see exactly what was dropped.
+
+**D. AI PROMPT NOW CARRIES A "CRITICAL POLICY — MULTI-COPY W-2 LAYOUTS
+ARE EXPECTED" BLOCK** right after the redactions policy. Explicitly tells
+the model:
+
+- FOLD AND DETACH HERE perforation lines are legitimate form features.
+- Matching values across Copy B / Copy 2 / Copy C are REQUIRED, not
+  template reuse.
+- Compact 12a-12d and 13 cells may look tightly stacked with small suffix
+  letters — do NOT flag as structural error unless the suffixes are
+  CLEARLY absent (not just faint/small).
+- Compact cells can make small text look "clipped" — only report clipping
+  when unambiguous.
+- Legitimate Box 14 state codes: QOC, NYPSL(-E), NYSDI(-E), NYPFL(-E),
+  CASDI, NJSDI/NJFLI, RISDI, WAPFML, MAPFML, ORPFML. Don't call them
+  placeholders.
+- Real multi-copy fraud tells: INCONSISTENT values across copies, or
+  overwritten values inside one copy while the others are clean.
+
+**E. `KNOWN_BOX14_CODES` WIDENED** with QOC and the state-specific codes
+above so the deterministic Box 14 check also recognizes them.
+
+**F. REGRESSION TEST** `test_myssy_2026_09_02.py` — 37 tests covering:
+
+- Multi-copy detector: 8 pos/neg cases including FOLD AND DETACH alone,
+  case-insensitivity, multi-signal without fold marker, single Copy
+  reference, single ADP mention, empty text, Intuit single-copy.
+- False-positive classifier: 18 cases across all 4 flag kinds — each
+  positive uses the EXACT language from the file 2745525 flags, plus
+  negatives that must still fire (real N/A, real blur, real line-through,
+  real Box 12 missing amount).
+- End-to-end AI-flag pipeline: mock AI response reconstructing all 10
+  flags from file 2745525; verify all 10 suppressed on multi-copy, all
+  10 still fire on non-multi-copy (guardrail), genuine font-size tell
+  still fires on multi-copy, audit-trail flag added exactly once.
+- AI prompt audit: prompt contains "FOLD AND DETACH HERE", "IDENTICAL
+  values across Copy", "compact multi-copy", "QOC", "NYPSL".
+- Known Box 14 code updates: QOC, NYPSL, NYPSL-E, NYSDI, NYPFL, CASDI,
+  NJSDI, WAPFML, MAPFML all present.
+
+### Result
+
+- **File 2745525 (BRITTANY B BENNETT / ADP multi-copy)**: 10 critical AI
+  false positives dropped, single info-level audit-trail flag added,
+  deterministic score = 0/LOW absent genuine tells. If the form actually
+  has font-size inconsistency, ink-bimodal, math errors, invalid EIN,
+  missing decimal formatting, or wrong tax year styling, those still
+  fire independently.
+- **Guardrail verified**: same AI response on a non-multi-copy form
+  fires ALL 10 critical flags (no accidental blanket suppression).
+- **All 11 prior Myssy regression tests still PASS** (07-03 through
+  08-27). All 37 new tests PASS.
+- **Answer to Myssy's threshold question**: no threshold adjustment
+  needed — the issue was the AI vision model misreading a specific
+  compact-layout family. Lowering thresholds would have masked real
+  fraud too.
+
+*Changes implemented by Molesley, 2026-09-02*
