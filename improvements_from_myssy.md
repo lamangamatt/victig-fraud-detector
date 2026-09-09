@@ -967,3 +967,91 @@ above so the deterministic Box 14 check also recognizes them.
   fraud too.
 
 *Changes implemented by Molesley, 2026-09-02*
+
+## 2026-09-08 — Numeric Field Misattribution Pair (Myssy Clayson, files 2727974 + 2747281)
+
+**Reporter:** Myssy Clayson, two emails on 2026-09-08 evening. Both are the
+same root class: values associated with the WRONG labels during data
+extraction on column-layout documents.
+
+**Sample 1 (file 2727974, ADP paystub):** the Gross Pay line reads
+`Gross Pay  80.00  5752.11  134985.57` (hours / current / YTD). The
+extraction regex captured the FIRST number after the label — 80.00 hours —
+as gross pay, then "Net pay ($4,483.31) exceeds gross pay ($80.00)" fired
+as a +45 critical. MEDIUM 40 on a legitimate stub.
+
+**Sample 2 (file 2747281, Takeda/Randstad 3-year W-2 packet):** the
+`box\s*1` wages pattern matched the phrase "box 12" in the form's fine
+print ("See Instructions for box 12") and captured the digit "2" as wages.
+$2.00 wages + $7,376.75 withholding → "Impossible Federal Tax Rate
+368,837.5%" critical + low-wage warning → HIGH 100. (Myssy described the
+EIN being read as a dollar amount — same mechanism: OCR column layouts
+dissociate labels from values, and loose regexes then bind whatever digits
+come next.)
+
+### Fixes (document_analyzer.py)
+
+**A. Line-aware paystub money extraction.** Money-field patterns
+(gross_pay, net_pay, federal_tax, state_tax) now capture the full line
+remainder; new `_pick_money_from_line()` tokenizes every number and picks
+the correct one. Hours rule: for gross_pay with 3+ tokens where the first
+is ≤ 500 and the second ≥ 4× the first, take the second (current-period
+dollars). Two-token lines (current/YTD) keep the first. Verified against
+part-time edge cases (tiny legit gross, 2-token and 3-token variants).
+
+**B. W-2 pattern hardening.**
+- Box numbers carry a `(?![0-9a-dA-D])` lookahead — `box 1` can no longer
+  match "box 12"/"box 14"/"12a" fine print (this also fixed the low-wage
+  fallback regex, which had the same hole).
+- Captures are SAME-LINE only (`[: \t]*` instead of `[:\s]*`). OCR'd
+  label-row/value-row layouts no longer bind the wrong value; a missing
+  field is safer than a wrong one because math checks skip absent fields.
+- Captures require a leading digit (a bare comma used to slip through and
+  store an empty-string wages value).
+- Second-stage bridge: if the strict same-line pattern misses, a bridged
+  variant (`label [^\n]{0,40}? value`) runs but REQUIRES cents — so
+  "Box 1 Wages, tips, other compensation: 55,432.10" extracts, while
+  stray fine-print integers never do.
+
+**C. Sanity gates (misparse ≠ fraud).**
+- `_validate_w2_math`: withholding > wages (rate > 100%) is an extraction
+  artifact — no fabricator types withholding larger than wages. Emits
+  info-level "Extraction Uncertain - Wage Fields" (+0) and skips wage
+  math. Rates 50–100% (plausible-as-typed but impossible) still fire the
+  critical.
+- `_validate_pay_stub_math`: net > gross with gross < $500 = column
+  misparse → info-level "Extraction Uncertain - Gross Pay Field" (+0).
+  Plausible-sized gross with net above it still fires the critical
+  (the real fraud pattern).
+- `_check_low_wages_with_withholding`: two consistency guards — skip when
+  a sibling wage field is ≥ 4× the tiny wages value, and skip when the
+  document's own largest $-amount (≥ $2,000 and ≥ 4× wages) contradicts
+  the parse. The 2026-07-03 fraud pattern (consistently tiny figures,
+  no large amounts anywhere) still fires.
+
+### Regression
+
+`test_myssy_2026_09_08.py` — 24 tests: 8 unit tests for the token picker,
+4 for box boundaries/same-line/bridge behavior, 6 for the sanity gates
+(including still-fires cases for real fraud patterns), and 6 end-to-end
+tests against the two real files (gitignored PII; skip cleanly when
+absent).
+
+One intermediate regression caught and fixed during development: the
+same-line restriction made RG_Sage (2026-08-12 sample) extract no wages,
+so the integer-tolerant low-wage fallback grabbed "496" from the ADP
+Earnings Summary's space-separated currency triplets. The largest-amount
+consistency guard resolves it; 08-12 and 07-03 both verified green after.
+
+### Results
+
+- File 2727974: MEDIUM 40 → **LOW 10**, gross extracts $5,752.11, zero
+  criticals.
+- File 2747281: HIGH 100 → no numeric-misparse flags at all (wages
+  correctly absent rather than $2.00; "Impossible Federal Tax Rate" and
+  low-wage warning gone). Remaining elevated score is from visual
+  signals on the scanned multi-year packet (bimodal darkness etc.) —
+  conservative by design, separate topic.
+- Full suite: 13/13 test files green (07-03 → 09-08).
+
+*Changes implemented by Molesley, 2026-09-09*

@@ -1716,7 +1716,7 @@ class DocumentAnalyzer:
         if wages is None:
             # Broader pattern: standalone amounts that appear near box 1 / wages labels
             wage_match = re.search(
-                r'(?:box\s*1|wages[,\s]|tips)[^\n]{0,30}?(\d{1,7}(?:\.\d{2})?)',
+                r'(?:box\s*1(?![0-9a-dA-D])|wages[,\s]|tips)[^\n]{0,30}?(\d{1,7}(?:\.\d{2})?)',
                 text, re.IGNORECASE
             )
             if wage_match:
@@ -1732,6 +1732,41 @@ class DocumentAnalyzer:
 
         if wages is None or wages >= LOW_WAGE_THRESHOLD:
             return
+
+        # 2026-09-08 guard #1 (Myssy Clayson follow-through): the document's
+        # own $-formatted amounts contradict a sub-$2,000 wages parse. If the
+        # doc visibly carries dollar figures well above the low-wage
+        # threshold (e.g. an ADP Earnings Summary showing $496,702.91), a
+        # tiny "wages" capture is a tokenization artifact (space-separated
+        # currency triplets, stray fine-print digits), not a fraud tell.
+        # Genuine fabricated low-wage W-2s (2026-07-03 sample: $918/$360)
+        # do not display large dollar amounts anywhere on the page.
+        largest = data.get('largest_amount')
+        try:
+            largest = float(largest) if largest is not None else None
+        except (TypeError, ValueError):
+            largest = None
+        if largest is not None and largest >= LOW_WAGE_THRESHOLD and largest >= 4 * max(wages, 1.0):
+            return
+
+        # 2026-09-08 (Myssy Clayson, file 2747281): extraction-consistency
+        # guard. If a sibling wage field (SS wages / Medicare wages) or any
+        # withholding figure is wildly larger than the extracted Box 1 value,
+        # the tiny "wages" number is a column/label misparse (e.g. a stray
+        # digit from W-2 fine print), not a fraud tell. Real fabricated
+        # low-wage W-2s show CONSISTENTLY low figures across boxes.
+        def _f(v):
+            try:
+                return float(str(v).replace(',', '').replace('$', '').strip())
+            except (TypeError, ValueError):
+                return None
+
+        siblings = [_f(data.get('social_security_wages')),
+                    _f(data.get('medicare_wages')),
+                    _f(data.get('federal_withheld'))]
+        for s in siblings:
+            if s is not None and wages > 0 and s >= 4 * wages and s >= LOW_WAGE_THRESHOLD:
+                return  # fields disagree wildly -- extraction unreliable
 
         # Now check for any withholding
         withholding_fields = [
@@ -2133,6 +2168,43 @@ class DocumentAnalyzer:
     # -----------------------------------------------------------------------
 
     def _extract_document_data(self, text: str, doc_type: str) -> Dict:
+        return self._extract_document_data_inner(text, doc_type)
+
+    @staticmethod
+    def _pick_money_from_line(line_remainder: str, field: str):
+        """Select the correct dollar figure from a multi-column stub line.
+
+        Multi-column paystubs (ADP and others) print several numbers after a
+        label. Layouts seen in production:
+
+            Gross Pay    80.00    5752.11    134985.57   (hours/current/YTD)
+            Net Pay              4483.31     98182.56    (current/YTD)
+            Federal Withholding Tax  412.69  14387.20    (current/YTD)
+
+        Rules (Myssy Clayson 2026-09-08, file 2727974):
+          * Tokenize every number on the line.
+          * For gross_pay with 3+ tokens: if the FIRST token is hours-like
+            (<= 500, and the second token is >= 4x the first), drop it and
+            take the second token (the current-period dollar amount).
+          * Otherwise take the first token (current period; later tokens are
+            YTD).
+        Returns float or None.
+        """
+        tokens = re.findall(r'\d[\d,]*\.?\d*', line_remainder or '')
+        values = []
+        for t in tokens:
+            try:
+                values.append(float(t.replace(',', '')))
+            except ValueError:
+                continue
+        if not values:
+            return None
+        if field == 'gross_pay' and len(values) >= 3:
+            if values[0] <= 500 and values[1] >= 4 * max(values[0], 1):
+                return values[1]
+        return values[0]
+
+    def _extract_document_data_inner(self, text: str, doc_type: str) -> Dict:
         """Extract structured data from document text."""
         data = {}
         
@@ -2185,19 +2257,24 @@ class DocumentAnalyzer:
         if doc_type == "Pay Stub":
             patterns = {
                 'gross_pay': [
-                    r'(?:gross\s*pay|gross\s*earnings?|total\s*earnings?)[:\s]*\$?([\d,]+\.?\d*)',
-                    r'(?:current\s*gross)[:\s]*\$?([\d,]+\.?\d*)',
+                    # Capture the REST OF THE LINE, not the first number.
+                    # Multi-column stubs (ADP: "Gross Pay  80.00  5752.11  134985.57"
+                    # = hours / current / YTD) put the HOURS figure first; the
+                    # token-selection logic below picks the correct dollar value.
+                    # (Myssy Clayson 2026-09-08, file 2727974.)
+                    r'(?:gross\s*pay|gross\s*earnings?|total\s*earnings?)[: \t]*([^\n]+)',
+                    r'(?:current\s*gross)[: \t]*([^\n]+)',
                 ],
                 'net_pay': [
-                    r'(?:net\s*pay|take\s*home|net\s*amount)[:\s]*\$?([\d,]+\.?\d*)',
-                    r'(?:current\s*net)[:\s]*\$?([\d,]+\.?\d*)',
+                    r'(?:net\s*pay|take\s*home|net\s*amount)[: \t]*([^\n]+)',
+                    r'(?:current\s*net)[: \t]*([^\n]+)',
                 ],
                 'federal_tax': [
-                    r'(?:federal\s*tax|fed\s*tax|federal\s*withholding)[:\s]*\$?([\d,]+\.?\d*)',
-                    r'(?:fed\s*w/?h)[:\s]*\$?([\d,]+\.?\d*)',
+                    r'(?:federal\s*tax|fed\s*tax|federal\s*withholding(?:\s*tax)?)[: \t]*([^\n]+)',
+                    r'(?:fed\s*w/?h)[: \t]*([^\n]+)',
                 ],
                 'state_tax': [
-                    r'(?:state\s*tax|state\s*withholding)[:\s]*\$?([\d,]+\.?\d*)',
+                    r'(?:state\s*tax|state\s*withholding)[: \t]*([^\n]+)',
                 ],
                 'pay_period': [
                     r'(?:pay\s*period|period)[:\s]*(\d{1,2}/\d{1,2}/\d{2,4})\s*(?:to|-)\s*(\d{1,2}/\d{1,2}/\d{2,4})',
@@ -2212,7 +2289,11 @@ class DocumentAnalyzer:
                     r'(?:hours|regular\s*hours)[:\s]*([\d.]+)',
                 ],
             }
-            
+
+            # Fields whose captured group is a LINE REMAINDER that must be
+            # token-parsed (see _pick_money_from_line).
+            line_money_fields = {'gross_pay', 'net_pay', 'federal_tax', 'state_tax'}
+
             for field, field_patterns in patterns.items():
                 for pattern in field_patterns:
                     match = re.search(pattern, text, re.I)
@@ -2220,6 +2301,11 @@ class DocumentAnalyzer:
                         if field == 'pay_period':
                             data['pay_period_start'] = match.group(1)
                             data['pay_period_end'] = match.group(2)
+                        elif field in line_money_fields:
+                            picked = self._pick_money_from_line(match.group(1), field)
+                            if picked is None:
+                                continue  # try next pattern
+                            data[field] = picked
                         else:
                             val = match.group(1).replace(',', '')
                             try:
@@ -2231,18 +2317,38 @@ class DocumentAnalyzer:
         # W-2 specific extraction
         elif doc_type == "W-2":
             w2_patterns = {
-                'wages': r'(?:box\s*1|wages,?\s*tips)[:\s]*\$?([\d,]+\.?\d*)',
-                'federal_withheld': r'(?:box\s*2|federal.*withheld)[:\s]*\$?([\d,]+\.?\d*)',
-                'social_security_wages': r'(?:box\s*3|social\s*security\s*wages)[:\s]*\$?([\d,]+\.?\d*)',
-                'social_security_tax': r'(?:box\s*4|social\s*security\s*tax)[:\s]*\$?([\d,]+\.?\d*)',
-                'medicare_wages': r'(?:box\s*5|medicare\s*wages)[:\s]*\$?([\d,]+\.?\d*)',
-                'medicare_tax': r'(?:box\s*6|medicare\s*tax)[:\s]*\$?([\d,]+\.?\d*)',
-                'state_wages': r'(?:box\s*16|state\s*wages)[:\s]*\$?([\d,]+\.?\d*)',
-                'state_tax': r'(?:box\s*17|state.*tax)[:\s]*\$?([\d,]+\.?\d*)',
+                # 2026-09-08 (Myssy Clayson, file 2747281): two hardening fixes.
+                # (1) Box numbers now carry a negative lookahead so "box 1"
+                #     cannot match the "box 12"/"box 14" instruction references
+                #     that appear in W-2 fine print (that misfire captured the
+                #     "2" of "box 12" as wages = $2.00).
+                # (2) Captures are SAME-LINE only ([: \t]* instead of [:\s]*).
+                #     OCR'd column layouts put labels and values on separate
+                #     lines in reading order ("1 Wages ... 2 Federal ... /
+                #     7376.75 / 450.87"), so a cross-line grab associates the
+                #     wrong value with the label (EIN or a neighboring box).
+                #     A missing value is safer than a wrong one: math checks
+                #     skip when fields are absent.
+                'wages': r'(?:box\s*1(?![0-9a-dA-D])|wages,?\s*tips)[: \t]*\$?(\d[\d,]*\.?\d*)',
+                'federal_withheld': r'(?:box\s*2(?![0-9a-dA-D])|federal[^\n]{0,25}withheld)[: \t]*\$?(\d[\d,]*\.?\d*)',
+                'social_security_wages': r'(?:box\s*3(?![0-9a-dA-D])|social\s*security\s*wages)[: \t]*\$?(\d[\d,]*\.?\d*)',
+                'social_security_tax': r'(?:box\s*4(?![0-9a-dA-D])|social\s*security\s*tax)[: \t]*\$?(\d[\d,]*\.?\d*)',
+                'medicare_wages': r'(?:box\s*5(?![0-9a-dA-D])|medicare\s*wages)[: \t]*\$?(\d[\d,]*\.?\d*)',
+                'medicare_tax': r'(?:box\s*6(?![0-9a-dA-D])|medicare\s*tax)[: \t]*\$?(\d[\d,]*\.?\d*)',
+                'state_wages': r'(?:box\s*16(?![0-9a-dA-D])|state\s*wages)[: \t]*\$?(\d[\d,]*\.?\d*)',
+                'state_tax': r'(?:box\s*17(?![0-9a-dA-D])|state[^\n]{0,15}tax)[: \t]*\$?(\d[\d,]*\.?\d*)',
             }
             
             for field, pattern in w2_patterns.items():
                 match = re.search(pattern, text, re.I)
+                if not match:
+                    # Second stage: bridge label-to-value WITHIN the same line
+                    # ("Box 1 Wages, tips, other compensation: 55,432.10").
+                    # The bridged variant requires CENTS so stray fine-print
+                    # digits ("see page 2") can never be captured as money.
+                    label_part = pattern.split('[: \\t]*')[0]
+                    bridged = label_part + r'[^\n]{0,40}?(\d[\d,]*\.\d{2})'
+                    match = re.search(bridged, text, re.I)
                 if match:
                     val = match.group(1).replace(',', '')
                     try:
@@ -2866,6 +2972,26 @@ class DocumentAnalyzer:
         # Check 1: Net cannot exceed gross
         if gross and net:
             if net > gross:
+                # 2026-09-08 (Myssy Clayson, file 2727974): a tiny "gross"
+                # next to a plausible net is an extraction artifact (hours
+                # column or partial figure grabbed as gross), not fraud.
+                # Real net>gross fabrications show a plausible-sized gross.
+                if gross < 500:
+                    result['errors'].append({
+                        'check': 'Net vs Gross',
+                        'error': f'Gross (${gross:,.2f}) implausibly small vs net (${net:,.2f}) — extraction unreliable; math checks skipped',
+                        'severity': 'info'
+                    })
+                    self._add_flag(
+                        'Extraction Uncertain - Gross Pay Field',
+                        f'The extracted gross pay (${gross:,.2f}) is implausibly small next to net pay (${net:,.2f}). '
+                        f'This pattern indicates the document\'s column layout confused the field extractor '
+                        f'(e.g. an hours figure read as dollars), so wage math checks were skipped. '
+                        f'Verify the figures manually; this is not itself a fraud indicator.',
+                        'info',
+                        0
+                    )
+                    return result
                 result['valid'] = False
                 result['errors'].append({
                     'check': 'Net vs Gross',
@@ -2951,6 +3077,29 @@ class DocumentAnalyzer:
         # Check 1: Federal withholding rate
         if wages and federal:
             fed_rate = federal / wages
+            if fed_rate > 1.0:
+                # 2026-09-08 (Myssy Clayson, file 2747281): withholding GREATER
+                # THAN wages is an extraction artifact, not fraud math. OCR'd
+                # column layouts (labels row, then values row) associate the
+                # wrong value with the wages label -- e.g. Box 1's $7,376.75
+                # landing in federal_withheld while wages captured a stray "2"
+                # from fine print. No fabricator types withholding larger than
+                # wages; a misparse does. Skip wage-based math; note it.
+                result['errors'].append({
+                    'check': 'Federal Rate',
+                    'error': f'Withholding (${federal:,.2f}) exceeds wages (${wages:,.2f}) — extraction unreliable; wage math checks skipped',
+                    'severity': 'info'
+                })
+                self._add_flag(
+                    'Extraction Uncertain - Wage Fields',
+                    f'The extracted figures (wages ${wages:,.2f}, federal withholding ${federal:,.2f}) are '
+                    f'internally inconsistent in a way that indicates the document\'s column layout confused '
+                    f'the field extractor, not that the document is fraudulent. Wage-based math checks were '
+                    f'skipped. Verify the figures manually against the document image.',
+                    'info',
+                    0
+                )
+                return result
             if fed_rate > 0.50:
                 result['valid'] = False
                 result['errors'].append({
