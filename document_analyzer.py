@@ -3507,11 +3507,14 @@ Flags Found So Far: {len(self.flags)}
 
             # v2.5: Education documents get a different prompt — the W-2/box-numbering
             # detection logic below is noise for a diploma or transcript.
+            # 2026-09-09 (cost work): the instruction prompt is now fully static
+            # per doc_type and sent as a prompt-cached block; the per-document
+            # CONTEXT rides in a separate uncached block after the image.
             education_types = ("Diploma", "Transcript", "Professional License/Certification", "Diploma/Transcript")
             if doc_type in education_types:
-                prompt = self._build_education_ai_prompt(doc_type, context)
+                prompt = self._build_education_ai_prompt(doc_type)
             else:
-                prompt = self._build_employment_ai_prompt(doc_type, context)
+                prompt = self._build_employment_ai_prompt(doc_type)
 
             # Model resilience (2026-08-18, Myssy Clayson investigation): the
             # previously-pinned "claude-sonnet-4-20250514" now returns 404
@@ -3543,6 +3546,17 @@ Flags Found So Far: {len(self.flags)}
                             {
                                 "role": "user",
                                 "content": [
+                                    # Static instruction prompt FIRST, marked for
+                                    # prompt caching. Identical bytes across every
+                                    # analysis of the same doc_type, so back-to-back
+                                    # analyses (the verification team works in
+                                    # batches) bill this ~4.8K-token block at ~10%
+                                    # of normal input price on cache hits.
+                                    {
+                                        "type": "text",
+                                        "text": prompt,
+                                        "cache_control": {"type": "ephemeral"},
+                                    },
                                     {
                                         "type": "image",
                                         "source": {
@@ -3553,7 +3567,11 @@ Flags Found So Far: {len(self.flags)}
                                     },
                                     {
                                         "type": "text",
-                                        "text": prompt,
+                                        "text": (
+                                            "CONTEXT:\n" + context +
+                                            "\nAnalyze the document image above per the "
+                                            "instructions and respond with only the JSON object."
+                                        ),
                                     },
                                 ],
                             }
@@ -3648,12 +3666,17 @@ Flags Found So Far: {len(self.flags)}
                 'error': str(e),
             }
 
-    def _build_education_ai_prompt(self, doc_type: str, context: str) -> str:
-        """Build AI vision prompt for education documents (diploma / transcript / cert)."""
-        return f"""You are an expert forensic document analyst specializing in academic and professional credential fraud. Analyze this {doc_type} image for signs of fabrication, alteration, or diploma-mill origin.
+    def _build_education_ai_prompt(self, doc_type: str, context: str = "") -> str:
+        """Build the STATIC AI vision prompt for education documents.
 
-CONTEXT:
-{context}
+        2026-09-09 (cost work): the returned text is now fully static per
+        doc_type so it can be sent as a prompt-cached content block
+        (cache_control: ephemeral). The per-document CONTEXT is appended by
+        the caller as a separate, uncached block AFTER the image. The
+        `context` parameter is retained for backward compatibility (tests
+        call this with a context arg) but is intentionally ignored.
+        """
+        return f"""You are an expert forensic document analyst specializing in academic and professional credential fraud. Analyze this {doc_type} image for signs of fabrication, alteration, or diploma-mill origin.
 
 ANALYZE FOR:
 
@@ -3734,12 +3757,17 @@ RESPOND IN THIS JSON FORMAT:
     "recommendation": "brief recommendation for the verifier"
 }}"""
 
-    def _build_employment_ai_prompt(self, doc_type: str, context: str) -> str:
-        """Build AI vision prompt for employment / tax documents (existing behavior)."""
-        return f"""You are an expert forensic document analyst specializing in employment verification fraud detection. Analyze this {doc_type} image for signs of fraud or manipulation.
+    def _build_employment_ai_prompt(self, doc_type: str, context: str = "") -> str:
+        """Build the STATIC AI vision prompt for employment / tax documents.
 
-CONTEXT:
-{context}
+        2026-09-09 (cost work): the returned text is now fully static per
+        doc_type so it can be sent as a prompt-cached content block
+        (cache_control: ephemeral). The per-document CONTEXT (today's date,
+        creator software, current risk score, etc.) is appended by the
+        caller as a separate, uncached block AFTER the image. The `context`
+        parameter is retained for backward compatibility but ignored.
+        """
+        return f"""You are an expert forensic document analyst specializing in employment verification fraud detection. Analyze this {doc_type} image for signs of fraud or manipulation.
 
 CRITICAL POLICY - REDACTIONS ARE EXPECTED (READ FIRST):
 
