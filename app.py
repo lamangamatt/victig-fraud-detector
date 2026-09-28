@@ -113,7 +113,7 @@ with col2:
     st.markdown("### v2.2")
     ai_status = "🟢 AI Enabled" if os.environ.get('ANTHROPIC_API_KEY') else "⚪ AI Disabled"
     st.caption(ai_status)
-    st.caption("build 2026-09-09b · extraction fixes + prompt caching (static instructions cached, ~90% input savings on batch runs)")
+    st.caption("build 2026-09-28 · fix false future-tax-year flag on stray numbers (5c139bb)")
 
 # Sidebar
 with st.sidebar:
