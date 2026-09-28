@@ -43,6 +43,7 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Any, Optional
 from pathlib import Path
 import hashlib
+from collections import Counter
 
 # PDF handling
 try:
@@ -1307,10 +1308,26 @@ class DocumentAnalyzer:
         current_month = datetime.now().month
         
         if doc_type in ["W-2", "1099"]:
-            # Find all 4-digit years in the document
+            # Find the document's actual tax year, not just any 4-digit
+            # number that happens to fall in 20[2-9]X.
+            #
+            # 2026-09-28 (Myssy Clayson, file 2767274 CVS Caremark): a blind
+            # `re.findall` over the whole document text picked up an
+            # unrelated 4-digit number (e.g. a control/ID number or OCR
+            # misread) and reported it as a "future tax year 2044" when the
+            # document's actual, repeatedly-printed tax year was 2025.
+            # The real tax year is printed multiple times on a W-2/1099
+            # (box labels, copy headers, filing-instruction boilerplate);
+            # a stray misread number appears once. Use the most-frequent
+            # year as the document's tax year, breaking ties toward the
+            # year closest to today so a single rare outlier can't hijack
+            # the flag.
             years_found = re.findall(r'\b(20[2-9]\d)\b', text)
-            for year_str in years_found:
-                doc_year = int(year_str)
+            if years_found:
+                year_counts = Counter(years_found)
+                max_count = max(year_counts.values())
+                candidate_years = [int(y) for y, c in year_counts.items() if c == max_count]
+                doc_year = min(candidate_years, key=lambda y: abs(y - current_year))
                 # A W-2 or 1099 for the current year shouldn't exist until January of the next year
                 # (or late December at earliest)
                 if doc_year > current_year:
@@ -1320,7 +1337,6 @@ class DocumentAnalyzer:
                         'critical',
                         50
                     )
-                    break
                 elif doc_year == current_year and current_month < 12:
                     # Current year W-2/1099 before December is suspicious
                     self._add_flag(
@@ -1329,7 +1345,6 @@ class DocumentAnalyzer:
                         'warning',
                         20
                     )
-                    break
         
         # Check for missing or suspicious year formats on W-2s
         if doc_type == "W-2":
