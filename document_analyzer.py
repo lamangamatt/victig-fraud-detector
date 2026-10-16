@@ -1135,6 +1135,61 @@ class DocumentAnalyzer:
                 )
                 return
         
+        # 2026-09-23 (Myssy Clayson, file 2763330 LifeLabs): catch-all for
+        # SSNs that don't match ANY expected pattern -- e.g. each copy shows
+        # a different mask format, or a digit count that doesn't match a
+        # real SSN (9 total digits). These fell through undetected before
+        # because the checks above only match specific KNOWN-GOOD or
+        # KNOWN-BAD patterns. Flag any SSN-labeled field whose digit/mask
+        # count is inconsistent with 9 total characters, or whose format
+        # differs between two copies of the same document, as suspicious.
+        # 2026-10-02 (Myssy Clayson, file 2773999): the original catch-all
+        # matched any digit-like text within 20 chars of "social security" --
+        # including unrelated boilerplate mentions of "Social Security
+        # Administration" etc, not just the actual labeled SSN field. That
+        # produced a false "malformed" hit even when the real SSN elsewhere
+        # on the document was correctly formatted. Tightened to require the
+        # match sit immediately after a field-label colon/space (not up to
+        # 20 chars of unrelated prose away), and to require a proper 3-group
+        # dash/space-separated shape (not just any run of digit-like chars).
+        # 2026-10-08 (Myssy Clayson, file 2763330 LifeLabs, SSN check stopped
+        # firing after the 10/02 tightening): on W-2s the label
+        # "Employee's social security number" is printed with the form's
+        # "OMB No. 1545-0008" right next to it, so the OCR text has the OMB
+        # number between the label and the SSN value. Allow that one known
+        # piece of form text (only that) between label and value.
+        ssn_candidates = re.findall(
+            r'(?:ssn|social security(?:\s*number)?)\s*[:#]?\s*'
+            r'(?:omb\s*no\.?\s*1545[-\s]?\d{4}\s*)?'
+            r'([x\*\d]{1,3}[-\s][x\*\d]{1,2}[-\s][x\*\d]{1,4})',
+            text_lower,
+        )
+        malformed = [c for c in ssn_candidates if len(re.sub(r'[-\s]', '', c)) != 9]
+        if malformed:
+            self._add_flag(
+                'SSN Format Inconsistent or Malformed',
+                f'Found {len(malformed)} SSN field(s) that do not total 9 characters '
+                f'in the standard XXX-XX-XXXX format, or where the mask/digit pattern '
+                f'is irregular (e.g. differs between copies of the same document, or is '
+                f'missing a digit). Legitimate SSNs are always 9 characters total, '
+                f'whether shown in full, truncated, or fully redacted. Verify manually.',
+                'critical',
+                35,
+            )
+        elif len(set(re.sub(r'[-\s]', '', c) for c in ssn_candidates)) > 1 and len(ssn_candidates) > 1:
+            # Multiple SSN mentions (e.g. multiple copies of the same W-2)
+            # showing DIFFERENT mask patterns for what should be the same
+            # person's SSN.
+            self._add_flag(
+                'SSN Format Differs Between Copies',
+                'Multiple SSN fields on this document show different masking/truncation '
+                'patterns for what appears to be the same individual. Legitimate '
+                'multi-copy documents (e.g. Copy B/C/2 of a W-2) mask the SSN '
+                'identically on every copy. Verify manually.',
+                'critical',
+                30,
+            )
+
         # Properly truncated SSN (last 4 visible) - follows IRS guidelines
         proper_truncation = r'[x\*_]{3}-[x\*_]{2}-\d{4}'
         if re.search(proper_truncation, text_lower):
@@ -1258,6 +1313,16 @@ class DocumentAnalyzer:
         """Check extracted text for anomalies."""
         text_lower = text.lower()
         
+        # 2026-10-16 (Myssy Clayson, file 2782626, Tandem Diabetes): a W-2/pay stub
+        # built from someone else's document (name field changed but the original
+        # name wasn't fully removed from every text layer) can carry TWO distinct
+        # full person names repeated throughout the extracted text, at the same
+        # address. The detector scored this LOW because every other signal (math,
+        # EIN format, box structure) looked fine -- only the raw text layer showed
+        # both "ABAKE SUNMOLA" and "ZAINAB SUNMOLA" at the identical address. This
+        # is a strong, cheap, deterministic tell independent of visual analysis.
+        self._check_multiple_employee_names(text, doc_type)
+        
         # Note: Redaction detection now happens earlier in analyze() before creator tool check
         
         # Check for placeholder text that wasn't replaced
@@ -1277,21 +1342,29 @@ class DocumentAnalyzer:
         
         # Check for invalid text in fields that should be numeric or blank
         # ENHANCED: Added more invalid values based on real fraud samples
-        invalid_field_values = ['n/a', 'not needed', 'not applicable', 'none', 'na', 'n.a.', 
+        # 2026-10-06 (Myssy Clayson, files 2773999/2762043): "na" and "nd"
+        # are too short -- they match as substrings inside unrelated words
+        # (e.g. "data", "signature", "nd" inside ordinal numbers like "2nd"),
+        # causing a recurring false positive verifiers could not replicate
+        # visually ("I cannot find NA"). Dropped the bare 2-letter entries;
+        # kept only the unambiguous multi-character/punctuated forms.
+        invalid_field_values = ['n/a', 'not needed', 'not applicable', 'none', 'n.a.',
                                 'see attached', 'refer to', 'tbd', 'pending', 'not required',
-                                'exempt', 'waived', 'n/d', 'nd']
+                                'exempt', 'waived', 'n/d']
         for invalid_val in invalid_field_values:
             # Look for these near dollar signs, box numbers, or common W2/pay stub fields
+            # require a word boundary after the value so e.g. "tbd" doesn't
+            # match as a prefix of some longer unrelated token.
             patterns = [
-                rf'\$\s*{re.escape(invalid_val)}',
-                rf'box\s*\d+[:\s]*{re.escape(invalid_val)}',
-                rf'wages[:\s]*{re.escape(invalid_val)}',
-                rf'tax[:\s]*{re.escape(invalid_val)}',
-                rf'gross[:\s]*{re.escape(invalid_val)}',
-                rf'net[:\s]*{re.escape(invalid_val)}',
-                rf'withholding[:\s]*{re.escape(invalid_val)}',
-                rf'state\s*(?:id|employer)[:\s]*{re.escape(invalid_val)}',  # NEW: State ID field
-                rf'employer\s*(?:state)?\s*id[:\s]*{re.escape(invalid_val)}',  # NEW
+                rf'\$\s*{re.escape(invalid_val)}\b',
+                rf'box\s*\d+[:\s]*{re.escape(invalid_val)}\b',
+                rf'wages[:\s]*{re.escape(invalid_val)}\b',
+                rf'tax[:\s]*{re.escape(invalid_val)}\b',
+                rf'gross[:\s]*{re.escape(invalid_val)}\b',
+                rf'net[:\s]*{re.escape(invalid_val)}\b',
+                rf'withholding[:\s]*{re.escape(invalid_val)}\b',
+                rf'state\s*(?:id|employer)[:\s]*{re.escape(invalid_val)}\b',  # NEW: State ID field
+                rf'employer\s*(?:state)?\s*id[:\s]*{re.escape(invalid_val)}\b',  # NEW
             ]
             for pattern in patterns:
                 if re.search(pattern, text_lower):
@@ -1356,13 +1429,32 @@ class DocumentAnalyzer:
             valid_years = [str(y) for y in range(current_year - 5, current_year + 1)]
             has_valid_year = any(year in text for year in valid_years)
             
+            # 2026-10-02 (Myssy Clayson, file 2771585, Jellysmack/Workday):
+            # the year was present but rendered in a non-black color (red),
+            # which this text-based check can miss depending on extraction,
+            # and which should not be treated as suspicious on its own --
+            # Workday and other modern HR systems routinely style the tax
+            # year in a colored heading. Downgrade to informational when the
+            # document is from a known legitimate HRIS/payroll producer.
             if not has_valid_year:
-                self._add_flag(
-                    'Missing Tax Year',
-                    'W-2 does not contain a clearly visible tax year. This is required on all legitimate W-2 forms.',
-                    'critical',
-                    40
-                )
+                legit_producer = self._has_legitimate_producer()
+                if legit_producer or re.search(r'\bworkday\b', text_lower):
+                    self._add_flag(
+                        'Tax Year Not Machine-Readable',
+                        'No tax year was found in the extracted text, but this document is '
+                        'from a known legitimate payroll/HRIS producer (e.g. Workday). The '
+                        'year may simply be styled in a color or font that extraction missed '
+                        '-- not treating this as a fraud indicator on its own. Verify visually.',
+                        'info',
+                        0
+                    )
+                else:
+                    self._add_flag(
+                        'Missing Tax Year',
+                        'W-2 does not contain a clearly visible tax year. This is required on all legitimate W-2 forms.',
+                        'critical',
+                        40
+                    )
             
             # NEW: Check Box 14 codes for validity
             self._check_box14_codes(text)
@@ -1430,6 +1522,55 @@ class DocumentAnalyzer:
                         15
                     )
     
+    def _check_multiple_employee_names(self, text: str, doc_type: str):
+        """Flag when two or more distinct full person names appear repeated in the
+        text layer alongside the same street address -- a strong indicator the
+        document was built by editing someone else's W-2/pay stub and the name
+        field was changed without fully removing the original name from every
+        occurrence (overlapping/duplicate text layers). 2026-10-16, Myssy
+        Clayson, file 2782626.
+        """
+        if doc_type not in ("W-2", "Pay Stub"):
+            return
+        # Find "FULL NAME" lines immediately followed by a street-address-looking line,
+        # repeated as a block (this is how name+address blocks print on W-2s/pay stubs).
+        # A name is 2-4 ALL-CAPS words (allows a middle name), e.g. "ZAINAB SUNMOLA".
+        name_line = re.compile(r'^([A-Z][A-Z\'\-]+(?:\s+[A-Z][A-Z\'\-]+){1,3})$')
+        addr_line = re.compile(r'^\d+\s+[A-Z0-9][A-Z0-9 ,.\'\-]+(?:DR|DRIVE|ST|STREET|AVE|AVENUE|RD|ROAD|LN|LANE|CT|COURT|WAY|BLVD|PARK|CIR|CIRCLE)\.?$', re.IGNORECASE)
+        lines = [l.strip() for l in text.split('\n') if l.strip()]
+        name_to_addresses = {}
+        for i, line in enumerate(lines):
+            m = name_line.match(line)
+            if not m:
+                continue
+            name = m.group(1)
+            # Skip the employer name itself (appears near a city/state/zip line without a leading number)
+            if i + 1 < len(lines) and addr_line.match(lines[i + 1]):
+                addr = lines[i + 1].upper()
+                name_to_addresses.setdefault(name, set()).add(addr)
+        if len(name_to_addresses) < 2:
+            return
+        # Only flag when 2+ distinct names share at least one address (or near-identical address,
+        # e.g. "RED ROCKS PARK DRIVE" vs "RED ROCK PARK DRIVE" -- a common typo between occurrences
+        # of the SAME altered document rather than two unrelated people).
+        def _normalize(addr):
+            return re.sub(r'\bROCKS\b', 'ROCK', re.sub(r'[^A-Z0-9 ]', '', addr))
+        norm_map = {}
+        for name, addrs in name_to_addresses.items():
+            for a in addrs:
+                norm_map.setdefault(_normalize(a), set()).add(name)
+        shared = [(addr, names) for addr, names in norm_map.items() if len(names) >= 2]
+        if shared:
+            addr, names = shared[0]
+            self._add_flag(
+                'Multiple Employee Names Detected',
+                f'This document\u2019s text contains {len(names)} different full names ({", ".join(sorted(names))}) at the same address. '
+                f'This strongly suggests the document was created by editing a different person\u2019s W-2/pay stub and the '
+                f'original name was not fully removed from every text layer. Verify the correct employee name directly with the applicant.',
+                'critical',
+                40
+            )
+
     def _check_ein_validity(self, ein: str, employer_state: str = None, employer_name: str = None):
         """Validate EIN format and check for fraud indicators."""
         if not ein:
@@ -1624,7 +1765,11 @@ class DocumentAnalyzer:
                 no_decimal_filtered.append(v)
 
         total_fields = len(decimal_amounts) + len(no_decimal_filtered)
-        if total_fields >= 3:
+        # 2026-09-21 (Myssy Clayson, file 2755667): redacted documents
+        # legitimately show 0 decimal-formatted amounts -- the numbers are
+        # blacked out, not omitted by a forger. Skip this check entirely on
+        # redacted documents; it can only produce false positives there.
+        if total_fields >= 3 and not self.redactions_detected:
             decimal_pct = len(decimal_amounts) / total_fields
             if decimal_pct < 0.50:
                 self._add_flag(
@@ -1659,6 +1804,20 @@ class DocumentAnalyzer:
         # Count distinct EIN values (format: ##-#######)
         eins_found = re.findall(r'\b\d{2}-\d{7}\b', text)
         unique_eins = set(eins_found)
+        # 2026-10-08 (Myssy Clayson, file 2763330 LifeLabs): Box 15's
+        # "Employer's state ID number" is often formatted like an EIN
+        # (e.g. "IL 46-4716239") and was counted as a second employer, so a
+        # standard 4-copy print of ONE W-2 was flagged as "2 distinct EINs".
+        # A ##-####### value printed right after a 2-letter state code is the
+        # state ID, not a second employer's EIN.
+        state_ids = set(re.findall(
+            r'\b(?:A[KLRZ]|C[AOT]|D[CE]|FL|GA|HI|I[ADLN]|K[SY]|LA|M[ADEINOST]|'
+            r'N[CDEHJMVY]|O[HKR]|PA|PR|RI|S[CD]|T[NX]|UT|V[AT]|W[AIVY])'
+            r'[\s|:]{1,4}(\d{2}-\d{7})\b',
+            text,
+        ))
+        if state_ids and len(unique_eins - state_ids) >= 1:
+            unique_eins = unique_eins - state_ids
 
         # Count occurrences of the employer block header phrase
         employer_headers = re.findall(
@@ -2004,17 +2163,36 @@ class DocumentAnalyzer:
                 # conclusive of tampering.
                 return
 
-            self._add_flag(
-                'Non-Black Machine Text',
-                f'{colored_ratio*100:.0f}% of machine text renders in {hue} '
-                f'(mean RGB {int(mean_r)}, {int(mean_g)}, {int(mean_b)}) '
-                f'instead of black. Legitimate tax documents print in '
-                f'black; colored typeset fields suggest a template-overlay '
-                f'pattern where data was typed into a form template '
-                f'rather than exported from real payer software.',
-                'warning',
-                25
-            )
+            # 2026-10-06 (Myssy Clayson, file 2771585, Jellysmack/Workday):
+            # modern HRIS systems like Workday legitimately style some
+            # fields in color (we already downgrade the colored-tax-year
+            # case specifically). Extend that same leniency here: on a
+            # known legitimate producer, colored machine text alone is
+            # informational, not a template-overlay warning.
+            legit_producer = self._has_legitimate_producer()
+            if legit_producer or re.search(r'\bworkday\b', (getattr(self, '_last_text_lower', '') or '')):
+                self._add_flag(
+                    'Colored Machine Text - Known Producer',
+                    f'{colored_ratio*100:.0f}% of machine text renders in {hue} '
+                    f'(mean RGB {int(mean_r)}, {int(mean_g)}, {int(mean_b)}) '
+                    f'instead of black. This document is from a known legitimate '
+                    f'payroll/HRIS producer, which can legitimately style fields '
+                    f'in color. Not treating this as a fraud signal on its own.',
+                    'info',
+                    0
+                )
+            else:
+                self._add_flag(
+                    'Non-Black Machine Text',
+                    f'{colored_ratio*100:.0f}% of machine text renders in {hue} '
+                    f'(mean RGB {int(mean_r)}, {int(mean_g)}, {int(mean_b)}) '
+                    f'instead of black. Legitimate tax documents print in '
+                    f'black; colored typeset fields suggest a template-overlay '
+                    f'pattern where data was typed into a form template '
+                    f'rather than exported from real payer software.',
+                    'warning',
+                    25
+                )
         except Exception:
             # Never let a visual heuristic break the analyzer.
             pass
@@ -3615,17 +3793,25 @@ Flags Found So Far: {len(self.flags)}
                     # Common: overall assessment flag
                     assessment = ai_result.get('overall_assessment', '')
                     confidence = ai_result.get('confidence', 50)
+                    # 2026-10-08 (Matt Visser): VICTIG flags what looks suspicious and
+                    # explains why; it does not decide whether a document is genuine.
+                    # The AI's overall read is reported as "indicators found" with the
+                    # reasons, never as "fraudulent"/"legitimate" or a confidence %.
+                    # (Scores and severities are unchanged.)
                     if assessment == 'LIKELY_FRAUDULENT':
                         self._add_flag(
-                            'AI Analysis: Likely Fraudulent',
-                            f"AI detected significant fraud indicators with {confidence}% confidence. Key findings: {', '.join(ai_result.get('key_findings', [])[:3])}",
+                            'AI Review: Several Suspicious Indicators',
+                            "The AI review found several things worth checking: "
+                            f"{'; '.join(ai_result.get('key_findings', [])[:3])}. "
+                            "These are reasons for review, not a determination about the document.",
                             'critical',
                             35,
                         )
                     elif assessment == 'SUSPICIOUS':
                         self._add_flag(
-                            'AI Analysis: Suspicious Elements',
-                            f"AI identified suspicious elements ({confidence}% confidence). Review recommended: {ai_result.get('recommendation', 'Manual review advised')}",
+                            'AI Review: Some Suspicious Indicators',
+                            f"The AI review noted: {ai_result.get('recommendation', 'some elements worth a manual look')}. "
+                            "These are reasons for review, not a determination about the document.",
                             'warning',
                             20,
                         )
@@ -3641,16 +3827,16 @@ Flags Found So Far: {len(self.flags)}
                         )
                         if has_critical:
                             self._add_flag(
-                                'AI Analysis: Inconclusive',
-                                f"AI did not independently confirm fraud ({confidence}% confidence), "
-                                f"but critical document-integrity flags are present, so the score is not discounted.",
+                                'AI Review: No Additional Indicators',
+                                "The AI review did not add indicators of its own, but the "
+                                "document-integrity flags above still apply, so the score is not discounted.",
                                 'info',
                                 0,
                             )
                         else:
                             self._add_flag(
-                                'AI Analysis: Appears Legitimate',
-                                f"AI analysis found no significant fraud indicators ({confidence}% confidence).",
+                                'AI Review: No Notable Indicators',
+                                "The AI review found nothing notable to flag.",
                                 'info',
                                 -10,
                             )
@@ -3886,6 +4072,107 @@ Font-size inconsistency, ink-bimodal, wrong tax year styling, math
 errors, invalid EIN, and missing decimal formatting continue to apply
 normally on multi-copy layouts. Report those if you actually see them.
 
+CRITICAL POLICY - PUERTO RICO W-2 (FORM 499R-2/W-2PR) IS A DIFFERENT, LEGITIMATE
+IRS/HACIENDA FORM, NOT A FABRICATED W-2 (READ THIRD):
+
+2026-10-02 (Myssy Clayson, file 2773563, UPS): Form 499R-2/W-2PR
+("Comprobante de Retencion") is the official wage/tax statement for
+employees in Puerto Rico, issued under Puerto Rico Treasury Department
+(Hacienda) rules, NOT the standard US IRS W-2. It has a DIFFERENT box
+layout, different labels (often bilingual Spanish/English), and different
+font/sizing conventions than a mainland US W-2. Do NOT compare its
+structure against standard-W-2 box numbering/sizing rules and do NOT treat
+structural differences from a US W-2 as "template manipulation" or
+"fabrication" -- a 499R-2/W-2PR is EXPECTED to look different. Only flag
+genuine internal inconsistencies (e.g. math errors, inconsistent values
+within the W-2PR itself), not deviation from US W-2 conventions.
+
+CRITICAL POLICY - "NET CHECK" VS "NET PAY" ON ADP PAY STUBS (READ FOURTH):
+
+ADP pay stub vouchers commonly print TWO separate net-amount fields, and
+they are NOT the same thing:
+
+  * "Net Check" (sometimes just "Check") is the amount of the PAPER CHECK
+    issued to the employee. If the employee is on direct deposit, this is
+    LEGITIMATELY $0.00 - the money went to their bank account instead of a
+    physical check. A $0.00 Net Check next to a nonzero Gross Pay is NORMAL
+    and expected for any direct-deposit employee. Do NOT flag this as
+    "mathematical impossibility", "wage amount manipulation", or any other
+    fraud indicator.
+  * "Net Pay" (sometimes "Net Amount" or appearing near "Checking"/account
+    info on the voucher/detail section) is the employee's actual take-home
+    pay after taxes and deductions. THIS is the figure to use for all
+    gross-minus-deductions math checks, net-vs-gross comparisons, and any
+    other calculation involving "net pay".
+
+Before flagging any net-pay math issue, confirm which of these two labels
+the number you are using is actually attached to. If a stub shows both
+"Net Check $0.00" and a separate "Net Pay" figure elsewhere on the page,
+use the "Net Pay" figure for math and ignore the $0.00 Net Check entirely -
+it is not a fraud signal on its own.
+
+Non-ADP payroll systems (Paylocity, Ceridian, ADP Workforce Now voucher
+formats, and many others) use the exact same concept under a DIFFERENT
+label: "Check Amount" (sometimes "Check Amt" or just "Check"). "Check
+Amount $0.00" next to a nonzero "Net Pay" figure and a "Distribution of Net
+Pay" / direct-deposit section listing checking/savings accounts that sum to
+the Net Pay figure is the SAME normal direct-deposit pattern - not fraud.
+Treat "Check Amount", "Net Check", and "Check" as interchangeable synonyms
+for the same paper-check field, and always use "Net Pay" (or "Total Net
+Pay") for math, never the check-amount field.
+
+CRITICAL POLICY - MULTI-COLUMN EARNINGS TABLES: HOURS VS DOLLARS VS YTD
+(READ FOURTH):
+
+Many payroll stubs (not just ADP) print earnings rows with FIVE or more
+numbers after the description, in this exact column order:
+
+    Description   Rate   Hrs(current)   Dollars(current)   YTD-Hrs   YTD-Dollars
+    Regular       97.1894   80.00        7,775.15           1,440.00   139,952.70
+
+The two numbers in the middle of the row are the CURRENT PERIOD hours and
+current period dollars. The two numbers near the end are YTD HOURS and YTD
+DOLLARS - in that order. A number like "1,440.00" appearing between a
+current-period dollar amount and a large YTD-dollar amount is almost always
+YTD HOURS (e.g., 18 pay periods x 80 hrs = 1,440 hrs), NOT a dollar amount.
+Do NOT divide it into gross pay, do NOT compare it against rate x hours as
+if it were a dollar figure, and do NOT report a "YTD calculation error"
+based on treating a YTD-hours number as if it were YTD dollars. If you are
+unsure whether a number in one of these tables is hours or dollars, check
+which number is directly followed by another, larger number in the same
+row that could plausibly be that field's dollar total - the smaller,
+rounder number immediately before a large YTD dollar total is virtually
+always YTD hours.
+
+CRITICAL POLICY - CHECK DATE VS DOCUMENT FILE METADATA (READ FIFTH):
+
+Do NOT compare the check date / pay date printed ON the document against
+the PDF file's internal creation-date metadata (when the PDF file itself
+was generated) and treat a later check date as "future-dated" or
+"tampering". It is completely normal and expected for a payroll PDF file to
+be generated/exported a few days BEFORE the check date it describes (e.g.,
+file metadata dated 9/2 for a check dated 9/4) - payroll is processed in
+advance of the actual pay date. This is NOT evidence of date tampering and
+must NOT be reported as "Date/Year Tampering", "Check date appears
+overlaid", or similar. The ONLY date comparison that matters for
+future-dating is the check/pay date versus TODAY'S ACTUAL DATE (provided in
+the CONTEXT block) - a check date that is in the past or present relative
+to today is normal regardless of what the PDF's internal file metadata
+says.
+
+CRITICAL POLICY - IDENTICAL BOXES 1, 3 AND 5 ARE NORMAL (2026-10-08, Myssy Clayson, file 2760873):
+Box 1 (wages), Box 3 (social security wages) and Box 5 (Medicare wages) are
+the SAME amount whenever the employee has no pre-tax deductions. Do NOT call
+identical Boxes 1/3/5 "mathematically impossible" or suspicious on that basis.
+Only note it if Box 12 clearly shows a pre-tax deferral code (D, E, F, G, S,
+AA, BB or EE) with a non-zero amount, since those lower Box 1 but not Boxes
+3/5 - and even then describe it as "worth checking", not "impossible".
+
+CRITICAL POLICY - SHADED BOX 9 IS NORMAL (2026-10-08, Myssy Clayson, file 2760672):
+Box 9 is unused on current W-2s and is commonly printed shaded, grey, hatched
+or cross-hatched. Do NOT report Box 9 shading/hatching as a border anomaly,
+manipulation indicator or font/box inconsistency.
+
 ANALYZE FOR:
 
 1. **Font Consistency** (Only flag when combined with other indicators)
@@ -3997,6 +4284,40 @@ ANALYZE FOR:
      and strongly suggest the document was assembled from a template or edited
      by hand.
 
+8b. **Highlighter Marks and Hatched/Cross-Hatch Shading Are NOT Overlay Evidence**
+   (2026-09-23, Myssy Clayson) Applicants and verifiers commonly mark up a
+   document with a colored highlighter (orange, yellow, green, pink) to draw
+   attention to a field -- this is normal annotation, NOT "digital
+   manipulation" or a colored rectangle overlay. A highlighter mark has soft,
+   slightly irregular edges and sits ON TOP of otherwise-normal text (the
+   text underneath is still fully legible and unchanged). Do NOT report a
+   highlighter mark as a manipulation indicator, colored rectangle overlay,
+   or template tampering.
+   Similarly, hatched or cross-hatched shading patterns (diagonal line
+   fills) appearing in a box are a legitimate print/PDF rendering style used
+   by some payroll systems for certain box types (e.g. Box 9 on some W-2
+   templates) -- they are NOT "unusual shading inconsistent with standard
+   W-2 format." Only flag shading as suspicious if it appears in a box that
+   should be plain/white on every W-2 of that same template AND obscures
+   otherwise-legible content.
+
+   Pay stubs very commonly shade an entire LABEL COLUMN or header ROW (a
+   light gray or tinted background) with BOLD text, specifically to visually
+   separate field titles/section headers from the data entries next to them
+   -- e.g. a shaded "Description" column next to a plain "Amount" column, or
+   a shaded header bar above an earnings table. This is a routine formatting
+   choice, not a redaction and not evidence of overlay/manipulation, even
+   though the shaded, bold label text will naturally show a different
+   darkness/ink level than the plain data text next to it (2026-09-25, Myssy
+   Clayson). Do NOT report a shaded label column/header row as a
+   "redaction," and do NOT count the darkness difference between a bold
+   shaded title and its adjacent plain data as a "bimodal text darkness"
+   fraud indicator -- that pattern is expected wherever a document
+   distinguishes labels from values using shading and/or bold weight. Only
+   treat darkness bimodality as suspicious when it appears WITHIN a single
+   data value or WITHIN body text of the same visual weight/background, not
+   between a styled label and its value.
+
 9. **Form Lines Crossing OR Clipping Text** (CRITICAL)
    Two related overlay tells belong here — flag EITHER:
 
@@ -4027,6 +4348,35 @@ ANALYZE FOR:
    cell boundary, it almost always means the text was overlaid on top of the
    form image rather than rendered by a real payroll system.
    Report exact box numbers where this occurs.
+
+   BEFORE reporting either tell, rule out physical/scan artifacts first
+   (2026-09-21, Myssy Clayson -- verifiers reported several false positives
+   of exactly this kind):
+   - A physically FOLDED document (common for mailed W-2s) casts a soft
+     diagonal or horizontal SHADOW across the fold crease. A shadow is NOT
+     a line -- it has soft, blurred edges and no consistent stroke width. A
+     genuine overlay/fabrication line has a hard edge and consistent width
+     across its full length. If what you see could be explained by a fold
+     shadow (soft-edged, roughly follows a horizontal or diagonal crease
+     across the whole page, not just one box), do NOT report it as a form
+     line crossing text.
+   - JPEG/scan COMPRESSION artifacts (blockiness, slight blur, minor color
+     banding) can make character edges look "clipped" or "truncated" at low
+     resolution even though the character is fully rendered. Only report
+     clipping when you can clearly see the character's stroke is actually
+     cut off (a straight edge exactly at the cell border), not merely soft
+     or slightly blurred from image quality.
+   - A "FOLD AND DETACH HERE" perforation line running near, but not
+     THROUGH, the state tax row (Boxes 15-17) is normal layout on many
+     single-copy vouchers, not just multi-copy prints. Only flag it if the
+     dashed line itself visibly overlaps a character or digit -- proximity
+     alone (running in the margin or between rows near Box 15-17) is not a
+     tell.
+   - If you are not highly confident you can see a hard-edged line actually
+     touching a character, or a clean flush cut at a cell border, do not
+     report it. State the specific box and describe exactly what you see
+     when you do report it -- vague descriptions like "form lines" without
+     a specific box and character are not reportable.
 
 10. **Inconsistent or Missing Box Borders** (CRITICAL for W-2)
     - Compare the border thickness/darkness/completeness of each box against its
@@ -4404,6 +4754,27 @@ RESPOND IN THIS JSON FORMAT:
             for indicator in mi.get('indicators', [])[:2]:
                 if self._is_wage_redaction_finding(indicator):
                     continue
+                # 2026-10-06 (Myssy Clayson, file 2773343, Knowles offer
+                # letter): the earlier offer-letter-redaction fix only
+                # suppressed AI findings phrased as "redaction" -- this file
+                # still fired via `manipulation_indicators` describing the
+                # exact same redacted salary bar as a "rectangle with sharp
+                # digital edges" / "digital manipulation". Same underlying
+                # fact (a compliance redaction on an offer letter's
+                # compensation field), different wording -- suppress here too.
+                indicator_lower = (indicator or '').lower()
+                if (doc_type == 'Offer Letter' and
+                        re.search(r'\b(salary|compensation|base\s*pay|wage)\b', indicator_lower) and
+                        re.search(r'\b(rectangle|redact|overlay|black\s*box|digital(?:ly)?\s*(?:edit|manipulat))', indicator_lower)):
+                    self._add_flag(
+                        'Compensation Redaction - Compliance Context',
+                        f'{indicator} VICTIG treats compensation redactions on offer letters '
+                        f'the same as wage redactions on pay stubs/W-2s -- expected for '
+                        f'salary-history-ban compliance, not suspicious.',
+                        'info',
+                        0,
+                    )
+                    continue
                 # 2026-09-02: on multi-copy ADP layouts, "text overlaid on
                 # template" and "text clipping at cell boundaries" are the
                 # exact AI-vision false-positive pattern (the compact 12a-12d
@@ -4428,7 +4799,31 @@ RESPOND IN THIS JSON FORMAT:
         # note explaining why they were expected.
         ra = ai_result.get('redaction_analysis', {})
         if ra.get('redactions_present'):
+            # 2026-10-02 (Myssy Clayson, file 2773343): a redacted BASE SALARY
+            # field on an OFFER LETTER was flagged as suspicious, but Myssy
+            # confirmed this is appropriate. Offer letters are subject to the
+            # same salary-history-ban compliance rationale as pay stubs/W-2s
+            # -- applicants are told to redact compensation figures before
+            # submission. Treat salary/compensation redactions on offer
+            # letters the same as wage redactions elsewhere: expected, not
+            # suspicious.
             for sus in (ra.get('suspicious_redactions', []) or [])[:3]:
+                sus_lower = (sus or '').lower()
+                is_offer_letter_salary = (
+                    doc_type == 'Offer Letter' and
+                    re.search(r'\b(salary|compensation|base\s*pay|wage)\b', sus_lower)
+                )
+                if is_offer_letter_salary:
+                    self._add_flag(
+                        'Compensation Redaction - Compliance Context',
+                        f'{sus} VICTIG treats compensation redactions on offer letters '
+                        f'the same as wage redactions on pay stubs/W-2s -- expected for '
+                        f'salary-history-ban compliance, not suspicious. Verify employment '
+                        f'using employer name, position, and dates, which should still be visible.',
+                        'info',
+                        0,
+                    )
+                    continue
                 self._add_flag(
                     'Suspicious Redaction on Identity/Date Field',
                     f'{sus} Redactions on employer name, employee name, or dates '
@@ -4520,8 +4915,15 @@ RESPOND IN THIS JSON FORMAT:
                 )
 
     # -------------------------------------------------------------------
-    # 2026-09-02 (Myssy Clayson, file 2745525): multi-copy ADP W-2 layout
-    # awareness. See improvements_from_myssy.md for the full context.
+    # 2026-09-21 (Myssy Clayson, files 2760672/2756600/2757019/2760506):
+    # single-copy W-2 clipping/shadow false positives. Verifiers reported
+    # the AI flagging "Box 14 text clipping", "perforation line too close
+    # to Box 15-17", "form line crosses through text", and "clipped state
+    # code" on documents where none of that was actually visible -- the
+    # common thread is a folded, scanned, or compressed single-copy W-2
+    # (not a multi-copy layout), where fold shadows and JPEG compression
+    # mimic the visual signature of overlay/clipping but are not fraud.
+    # See improvements_from_myssy.md for the full context.
     # -------------------------------------------------------------------
 
     def _is_adp_multi_copy_layout(self, text: str) -> bool:
