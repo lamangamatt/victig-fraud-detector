@@ -87,6 +87,7 @@ class DocumentAnalyzer:
         'workday': 'Workday',
         'ultipro': 'UltiPro/UKG',
         'ceridian': 'Ceridian Dayforce',
+        'dayforce': 'Ceridian Dayforce',
         'paylocity': 'Paylocity',
         'paycom': 'Paycom',
         'bamboohr': 'BambooHR',
@@ -1020,7 +1021,23 @@ class DocumentAnalyzer:
             (meta.get('producer') or '').lower(),
             (meta.get('software') or '').lower(),
         ])
-        return any(key in combined for key in self.LEGITIMATE_CREATORS)
+        if any(key in combined for key in self.LEGITIMATE_CREATORS):
+            return True
+        # 2026-10-30 (Myssy Clayson, Lincoln Property / Dayforce W-2s): an
+        # employee who prints a W-2 from the employer's payroll portal in a
+        # web browser ("Print to PDF") produces a file whose creator/producer
+        # is just "Chrome/Skia" or "Edge" -- the payroll system only shows up
+        # in the PDF *title* (e.g. "Earnings - Dayforce"). Those prints are
+        # pre-printed form + payroll data, so they legitimately show the same
+        # two-level darkness as a native ADP/Intuit print. Match whole words
+        # only so a stray substring ("adp" in "gadpet") cannot trigger this.
+        title = (meta.get('title') or '').lower()
+        return bool(title and self._PAYROLL_PORTAL_TITLE_RE.search(title))
+
+    _PAYROLL_PORTAL_TITLE_RE = re.compile(
+        r'\b(?:dayforce|ceridian|adp|paychex|paycom|paycor|paylocity|gusto|workday|'
+        r'ukg|ultipro|rippling|isolved|trinet|justworks|quickbooks|intuit)\b'
+    )
 
     def _check_file_anomalies(self, file_path: str, metadata: Dict):
         """Check for file-level anomalies."""
@@ -2302,9 +2319,20 @@ class DocumentAnalyzer:
         blue-text 1099-NEC scored LOW because each miss was
         individually 'info').
         """
+        # 2026-10-30: explanatory notes ("this is expected because...") are
+        # not anomalies; counting them made a clean portal print look odd.
+        explanatory = (
+            'Expected Text Darkness Variance',
+            'ADP Multi-Copy W-2 Layout Detected',
+            'AI Visual Observations (Low Weight)',
+            'AI Review: Observations (Low Weight',
+        )
         info_flags = [
             f for f in self.flags
             if f.get('severity') == 'info' and f.get('score_impact', 0) >= 0
+            and not any((f.get('title') or '').startswith(x) for x in explanatory)
+            and not (f.get('title') == 'Recently Created'
+                     and 'Normal for documents downloaded' in (f.get('description') or ''))
         ]
         # Safety in case of double-invocation
         already_added = any(
@@ -3798,7 +3826,21 @@ Flags Found So Far: {len(self.flags)}
                     # The AI's overall read is reported as "indicators found" with the
                     # reasons, never as "fraudulent"/"legitimate" or a confidence %.
                     # (Scores and severities are unchanged.)
-                    if assessment == 'LIKELY_FRAUDULENT':
+                    _lw_doc = bool(getattr(self, '_is_multi_copy_layout', False)
+                                   and doc_type == 'W-2' and self._has_legitimate_producer())
+                    if _lw_doc and assessment in ('LIKELY_FRAUDULENT', 'SUSPICIOUS'):
+                        # Summary built mostly from the geometry/typography
+                        # observations that are low weight on this layout.
+                        self._add_flag(
+                            'AI Review: Observations (Low Weight on This Layout)',
+                            "The AI review raised concerns, mostly about box layout and typography on a "
+                            "multi-copy payroll-system print; see 'AI Visual Observations (Low Weight)'. "
+                            "Any content-based findings are flagged separately below. "
+                            "These are reasons for review, not a determination about the document.",
+                            'info',
+                            0,
+                        )
+                    elif assessment == 'LIKELY_FRAUDULENT':
                         self._add_flag(
                             'AI Review: Several Suspicious Indicators',
                             "The AI review found several things worth checking: "
@@ -4167,6 +4209,22 @@ identical Boxes 1/3/5 "mathematically impossible" or suspicious on that basis.
 Only note it if Box 12 clearly shows a pre-tax deferral code (D, E, F, G, S,
 AA, BB or EE) with a non-zero amount, since those lower Box 1 but not Boxes
 3/5 - and even then describe it as "worth checking", not "impossible".
+
+CRITICAL POLICY - BROWSER-PRINTED PAYROLL PORTAL W-2s (2026-10-30, Myssy Clayson, Lincoln Property / Dayforce):
+Employees often print their W-2 from the employer's payroll portal (Dayforce, ADP,
+Paycom, Paylocity, Workday...) straight to PDF, usually THREE copies stacked on one page
+(Copy C, Copy B, Copy 2) with a wage-summary table above them. On that layout:
+- Box 13 is ONE box holding three small checkboxes (Statutory employee / Retirement plan /
+  Third-party sick pay) with an X in one. Do NOT describe it as "three separate rows".
+- Box 12 lines are "Code C / D / DD" (12a-12d). They are NOT Box 14 codes and "12b"/"13c"
+  are not placeholder text. Box 14 is usually empty.
+- The dashed line under Boxes 15-20 is the copy separator, not a line through text.
+- The pages are shrunk, so box borders look slightly lighter or heavier from copy to copy.
+  Do NOT report border weight, clipping or "overlay" unless text is unambiguously
+  unreadable or visibly pasted over a different value.
+- A deduction in parentheses in the wage-summary table, e.g. "Deferred Comp (12216.67)", is
+  a subtraction. Box 3/5 being higher than Box 1 is expected when Box 12 shows code D/E/G/S.
+Only report problems you can read unambiguously.
 
 CRITICAL POLICY - SHADED BOX 9 IS NORMAL (2026-10-08, Myssy Clayson, file 2760672):
 Box 9 is unused on current W-2s and is commonly printed shaded, grey, hatched
@@ -4647,6 +4705,27 @@ RESPOND IN THIS JSON FORMAT:
         """Turn employment / tax-document AI JSON into fraud flags."""
         is_multi_copy = getattr(self, '_is_multi_copy_layout', False)
 
+        # 2026-10-30 (Myssy Clayson, Lincoln Property / Dayforce W-2s scored
+        # 100/100): on a multi-copy W-2 print that comes from a recognised
+        # payroll system, the vision model cannot reliably resolve box-level
+        # geometry (three copies shrunk onto one page) and keeps inventing
+        # new wordings of the same misreads -- Box 13 "three separate rows",
+        # Box 12 codes read as Box 14 codes, "line crosses Box 15", "lighter
+        # Box 15 border". Pattern-matching each wording was whack-a-mole.
+        # For these documents, geometry/typography observations are kept
+        # visible but carry NO score (one info flag listing them at the end).
+        # Content checks (math, EIN/SSN, names, dates, text-layer checks) and
+        # the deterministic image checks are unaffected.
+        lowweight = bool(is_multi_copy and doc_type == 'W-2' and self._has_legitimate_producer())
+        lowweight_notes: List[str] = []
+
+        def _lw(category: str, text: str) -> bool:
+            """Record a low-weight observation. Returns True when the caller should skip scoring."""
+            if not lowweight:
+                return False
+            lowweight_notes.append(f'{category}: {str(text)[:200]}')
+            return True
+
         # Font consistency - only flag when AI provided corroborating indicators.
         # (Per Trish Gustin feedback June 2026: scanning/photocopying naturally
         # produces font variation; flag only when other fraud signals support it.)
@@ -4656,6 +4735,8 @@ RESPOND IN THIS JSON FORMAT:
             corroborating = font_check.get('corroborating_indicators', [])
             if corroborating and font_issues:
                 for issue in font_issues[:3]:
+                    if _lw('Font', issue):
+                        continue
                     self._add_flag(
                         'Font Mismatch with Corroborating Indicators',
                         f"{issue} (supported by: {', '.join(corroborating[:2])})",
@@ -4674,7 +4755,9 @@ RESPOND IN THIS JSON FORMAT:
             n_sizes = size_check.get('sizes_observed')
             corroborated = bool(font_check.get('corroborating_indicators')) or self._has_overlay_corroboration()
             already = any(f.get('title') == 'Inconsistent Font Sizes' for f in self.flags)
-            if corroborated and not already:
+            if corroborated and not already and _lw('Font size', "; ".join(fields[:3]) or 'values render at multiple sizes'):
+                pass
+            elif corroborated and not already:
                 detail = "; ".join(fields[:3]) if fields else "the typed values render at multiple sizes"
                 count = f"{n_sizes} distinct sizes" if isinstance(n_sizes, int) and n_sizes else "multiple sizes"
                 self._add_flag(
@@ -4734,6 +4817,11 @@ RESPOND IN THIS JSON FORMAT:
                 if is_multi_copy and self._looks_like_multi_copy_false_positive(issue, 'invalid_value'):
                     self._note_multi_copy_suppression(issue, 'Invalid Field Value (AI)')
                     continue
+                # Box 12/13/14 code readings: the text-layer check
+                # (_check_box14_codes) is authoritative; the model's read of
+                # tiny code labels on a shrunk multi-copy page is not.
+                if re.search(r'\bbox\s*1[234]\b', issue or '', re.IGNORECASE) and _lw('Box 12-14 codes', issue):
+                    continue
                 self._add_flag(
                     'Invalid Field Value (AI)',
                     issue,
@@ -4782,6 +4870,8 @@ RESPOND IN THIS JSON FORMAT:
                 # model). Real overlay/manipulation would corroborate with
                 # font-size inconsistency or ink-bimodal flags, which fire
                 # independently.
+                if _lw('Manipulation', indicator):
+                    continue
                 if is_multi_copy and self._looks_like_multi_copy_false_positive(indicator, 'manipulation'):
                     self._note_multi_copy_suppression(indicator, 'AI Detected Manipulation')
                     continue
@@ -4863,6 +4953,8 @@ RESPOND IN THIS JSON FORMAT:
                 # compact layout as unlabeled rows. Deterministic checks
                 # (font-size, ink-bimodal, math, EIN, decimal formatting)
                 # still fire independently if the form is actually forged.
+                if _lw('Box structure', issue):
+                    continue
                 if is_multi_copy and self._looks_like_multi_copy_false_positive(issue, 'box_structure'):
                     self._note_multi_copy_suppression(issue, 'Invalid Box Numbering / Structure')
                     continue
@@ -4877,6 +4969,8 @@ RESPOND IN THIS JSON FORMAT:
         overlap_check = ai_result.get('overlapping_text', {})
         if overlap_check.get('detected'):
             for issue in overlap_check.get('issues', [])[:3]:
+                if _lw('Overlapping text', issue):
+                    continue
                 self._add_flag(
                     'Overlapping Text Detected',
                     f'{issue} Text overlapping form fields or checkboxes is rare on system-generated documents and suggests manual editing or template assembly.',
@@ -4893,6 +4987,8 @@ RESPOND IN THIS JSON FORMAT:
                 # features and the compact-cell "clipping" claims are OCR
                 # artifacts. Drop those specific patterns; keep real
                 # line-through-text findings.
+                if _lw('Line through text', issue):
+                    continue
                 if is_multi_copy and self._looks_like_multi_copy_false_positive(issue, 'lines_crossing'):
                     self._note_multi_copy_suppression(issue, 'Form Line Crosses Through Text')
                     continue
@@ -4907,12 +5003,29 @@ RESPOND IN THIS JSON FORMAT:
         border_check = ai_result.get('box_border_anomalies', {})
         if border_check.get('detected'):
             for issue in border_check.get('issues', [])[:3]:
+                if _lw('Box borders', issue):
+                    continue
                 self._add_flag(
                     'Inconsistent Box Borders',
                     f'{issue} Genuine W-2s have uniform border weight across boxes in the same row; missing or lighter borders suggest the box was rebuilt or edited.',
                     'warning',
                     20,
                 )
+
+        if lowweight_notes:
+            self._add_flag(
+                'AI Visual Observations (Low Weight)',
+                'This is a multi-copy W-2 print from a recognised payroll system '
+                '(copy labels and perforation lines are drawn as graphics, three copies '
+                'per page). The AI vision review made the observations below about box '
+                'layout, borders and typography, but it cannot reliably resolve that '
+                'level of detail at this scale, so they carry no score. They are listed '
+                'so a reviewer can glance at the form if something looks off. Math, '
+                'SSN/EIN, name, date and other text-layer checks still apply.\n\n'
+                + '\n'.join(f'  \u2022 {n}' for n in lowweight_notes[:12]),
+                'info',
+                0,
+            )
 
     # -------------------------------------------------------------------
     # 2026-09-21 (Myssy Clayson, files 2760672/2756600/2757019/2760506):
@@ -4947,6 +5060,18 @@ RESPOND IN THIS JSON FORMAT:
 
         # Strong signal — alone is sufficient
         if re.search(r'fold\s+and\s+detach\s+here', text, re.IGNORECASE):
+            return True
+
+        # 2026-10-30 (Myssy Clayson, Lincoln Property / Dayforce W-2s): a
+        # browser print of a payroll-portal W-2 draws the copy labels and the
+        # FOLD AND DETACH HERE line as vector art, so none of that wording is
+        # in the text layer. What IS in the text layer is the same employee
+        # SSN and the same employer EIN repeated once per copy. A single-copy
+        # W-2 never repeats both, so this alone is sufficient.
+        eins = re.findall(r'(?<!\d)\d{2}-\d{7}(?!\d)', text)
+        ssns = re.findall(r'(?<![\dXx*])[\dXx*]{3}-[\dXx*]{2}-\d{4}(?!\d)', text)
+        if (eins and max(eins.count(e) for e in set(eins)) >= 2
+                and ssns and max(ssns.count(x) for x in set(ssns)) >= 2):
             return True
 
         text_lower = text.lower()
@@ -5030,6 +5155,13 @@ RESPOND IN THIS JSON FORMAT:
             # "Multiple instances of identical X across all three copies"
             re.compile(r'(?:identical|matching|same|multiple\s+instances)[^\n]{0,60}(?:copies|copy)', re.IGNORECASE),
             re.compile(r'across\s+all\s+(?:three|3|two|2)\s+copies', re.IGNORECASE),
+            # 2026-10-30 (Myssy, Dayforce W-2s): Box 3/5 above Box 1 is NORMAL
+            # whenever Box 12 shows a pre-tax deferral (401k etc.), and a
+            # deduction printed in parentheses in the wage-summary table is a
+            # subtraction, not a "negative value".
+            re.compile(r'box\s*[35]\b[^\n]{0,120}\b(?:higher|greater|more|exceed)[^\n]{0,40}box\s*1\b', re.IGNORECASE),
+            re.compile(r'(?:negative|parenthes)[^\n]{0,100}\bdeferred\s+comp', re.IGNORECASE),
+            re.compile(r'\bdeferred\s+comp[^\n]{0,100}(?:negative|parenthes)', re.IGNORECASE),
         ],
     }
 
