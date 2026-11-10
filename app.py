@@ -143,9 +143,9 @@ with st.sidebar:
     
     st.header("🎯 Risk Levels")
     st.markdown("""
-    🔴 **HIGH** (65+) - Strong fraud indicators  
-    🟡 **MEDIUM** (35-64) - Suspicious, needs review  
-    🟢 **LOW** (0-34) - Appears legitimate
+    🔴 **HIGH** (65+) - Several suspicious indicators, review first  
+    🟡 **MEDIUM** (35-64) - Some suspicious indicators, review  
+    🟢 **LOW** (0-34) - Nothing notable flagged
     """)
     
     st.divider()
@@ -602,20 +602,21 @@ if uploaded_file:
                     confidence = ai_result.get('confidence', 0)
                     
                     # Assessment badge
+                    # 2026-10-08 (Matt): flag + reasoning, never a verdict or confidence %
                     if assessment == 'LIKELY_FRAUDULENT':
                         badge_color = "#dc3545"
-                        badge_text = "🚨 LIKELY FRAUDULENT"
+                        badge_text = "🚩 Several suspicious indicators"
                     elif assessment == 'SUSPICIOUS':
                         badge_color = "#ffc107"
-                        badge_text = "⚠️ SUSPICIOUS"
+                        badge_text = "⚠️ Some suspicious indicators"
                     else:
                         badge_color = "#28a745"
-                        badge_text = "✅ LIKELY LEGITIMATE"
+                        badge_text = "✅ No notable indicators"
                     
                     st.markdown(f"""
                     <div class="ai-box">
                         <div class="ai-assessment">{badge_text}</div>
-                        <div>AI Confidence: {confidence}%</div>
+                        <div>Reasons for review are listed below. This is not a determination about the document.</div>
                     </div>
                     """, unsafe_allow_html=True)
                     

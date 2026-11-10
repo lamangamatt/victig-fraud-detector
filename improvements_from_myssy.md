@@ -1,5 +1,30 @@
 # VICTIG Fraud Detector Improvements
 
+## 2026-10-30 — Dayforce browser-printed W-2s scored 100/100 (Lincoln Property)
+
+**Reporter:** Myssy Clayson. Two W-2s printed from the Dayforce portal (3 copies on
+a page) scored HIGH while the detector's own "Recently Created" note said this is
+normal for portal downloads; "the old Box 12-17 errors are back".
+
+Causes and fixes (`test_myssy_2026_10_30.py`):
+1. Browser print = producer "Chrome/Skia"; payroll system only in PDF title ("Earnings -
+   Dayforce"). `_has_legitimate_producer` now also matches payroll-portal names as whole
+   words in the title, and `dayforce` was added to `LEGITIMATE_CREATORS`. That removed the
+   deterministic Bimodal/Inconsistent Darkness criticals (score 50 with AI off).
+2. Copy labels / perforation lines are vector art, so multi-copy was not recognised.
+   `_is_adp_multi_copy_layout` now also fires when the same SSN and the same EIN each appear
+   2+ times in the text layer.
+3. Regex suppression of each AI wording was whack-a-mole. On multi-copy + recognised payroll
+   system, AI box-geometry/typography observations (Box 13 rows, borders, lines, overlap,
+   font, Box 12-14 code reads) now go into ONE info flag "AI Visual Observations (Low
+   Weight)" (0 points, still visible). The AI summary flag is demoted the same way. Content
+   findings (dates, math, names, text layer) still score.
+4. Prompt policy for browser-printed portal W-2s (Box 13 one box, Box 12 vs 14 codes,
+   dashed copy separator, parenthesised deductions, Box 3/5 > Box 1 with deferrals).
+5. "Multiple Anomalies Detected" no longer counts explanatory info notes.
+Trade-off: a forger could set a PDF title to a payroll name; geometry-only AI observations
+would then carry no score, but text-layer, math and font-size checks still run.
+
 ## 2026-08-18 — W-2 Font-Size Miss + Dead AI Model (Kelly Vasquez)
 
 **Reporter:** Myssy Clayson (VICTIG Verifications). **Sample:** a fabricated
@@ -1055,3 +1080,18 @@ consistency guard resolves it; 08-12 and 07-03 both verified green after.
 - Full suite: 13/13 test files green (07-03 → 09-08).
 
 *Changes implemented by Molesley, 2026-09-09*
+
+## 2026-10-08: flags, not verdicts, plus fixes from the 9/23 re-run batch (msg 389)
+
+**Matt's direction:** VICTIG flags what looks suspicious and explains why. It does not decide whether a document is genuine.
+- The AI flag titles no longer read "AI Analysis: Likely Fraudulent / Suspicious Elements / Inconclusive / Appears Legitimate". They now read "AI Review: Several Suspicious Indicators / Some Suspicious Indicators / No Additional Indicators / No Notable Indicators". Descriptions list the reasons, with no confidence percentage.
+- The app's AI badge has no verdict or "AI Confidence". The sidebar risk-level text now describes indicators instead of fraud or legitimacy.
+- Scores and severities are unchanged.
+
+**Fixes:**
+- **2763330 LifeLabs, part 1.** Box 15's state ID ("IL 46-4716239") was counted as a second EIN, so the standard 4-copy print was flagged as "Multiple W-2 Forms on Single Page". A ##-####### value right after a 2-letter state code is now treated as the state ID.
+- **2763330 LifeLabs, part 2.** The SSN format check stopped firing after the 10/02 tightening. On W-2s, "OMB No. 1545-0008" sits between the SSN label and the value, and the regex now allows exactly that text. This is the likely cause; it has not been verified against the actual file (no attachment), so Myssy was asked to re-run it.
+- **2760873 IHeal.** Added a prompt policy: identical Boxes 1/3/5 are normal with no pre-tax deductions. They are never "mathematically impossible".
+- **2760672 Geisinger.** Added a prompt policy: a shaded or hatched Box 9 is normal.
+
+**Tests:** test_myssy_2026_10_08.py (10 tests).

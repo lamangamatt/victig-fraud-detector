@@ -1,8 +1,24 @@
+# Streamlit server config for behind-reverse-proxy hosting via
+# Tailscale Funnel at https://matts-mac-mini.tailefa08d.ts.net/fraud-detector/
+
+[server]
+baseUrlPath = "fraud-detector"
+port = 8899
+headless = true
+address = "127.0.0.1"
+
+# We're behind a trusted reverse proxy on localhost -- disable CORS + XSRF
+# checks that would otherwise reject same-origin proxied WebSocket requests.
+enableCORS = false
+enableXsrfProtection = false
+
+maxUploadSize = 50
+
+[browser]
+gatherUsageStats = false
+
 [theme]
 primaryColor = "#1E40AF"
 backgroundColor = "#FFFFFF"
 secondaryBackgroundColor = "#F3F4F6"
 textColor = "#111827"
-
-[server]
-maxUploadSize = 50
