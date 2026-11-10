@@ -440,6 +440,15 @@ class DocumentAnalyzer:
         # is available; keep a per-analyze default so stale state from a
         # previous run cannot leak in.
         self._is_multi_copy_layout = False
+        # 2026-11-09 (Myssy Clayson, detector-issues batch): plain
+        # single-copy photographed W-2s (phone photo, not folded, not an
+        # ADP/Dayforce multi-copy print) were getting the same Box 12/13
+        # structural misreads and bimodal-darkness flags as fabricated
+        # documents, because neither existing carve-out (multi-copy layout,
+        # folded/compressed single-copy) applies to a flat phone photo of a
+        # single W-2. Detected via EXIF camera metadata, which a phone photo
+        # always has and a scan/PDF/screenshot never does.
+        self._is_photographed_doc = False
         
         results = {
             'file_path': file_path,
@@ -470,6 +479,16 @@ class DocumentAnalyzer:
             text = self._ocr_image(file_path) if HAS_TESSERACT else ""
             image = Image.open(file_path)
             results['metadata']['file_type'] = 'Image'
+            # 2026-11-09 (Myssy Clayson, detector-issues batch): a phone
+            # photo always carries EXIF camera_make/camera_model; a scan,
+            # screenshot, or app-exported image never does. Use this to
+            # identify plain single-copy photographed W-2s so Box 12/13
+            # structural checks and bimodal-darkness flags can be suppressed
+            # the same way they already are for multi-copy ADP prints and
+            # folded/compressed scans (see _has_legitimate_producer and the
+            # multi-copy/folded-doc carve-outs below).
+            if results['metadata'].get('camera_make') or results['metadata'].get('camera_model'):
+                self._is_photographed_doc = True
         
         # Store metadata for downstream helper checks (producer-aware suppression
         # of visual/formatting flags that misfire on pre-printed IRS forms
@@ -3614,11 +3633,18 @@ class DocumentAnalyzer:
                 # bimodality as "template overlay" fraud. When we've already
                 # detected physical redactions, treat these darkness signals
                 # the same way we treat pre-printed IRS forms - benign.
-                suppress_darkness = legit_producer or self.redactions_detected
+                # 2026-11-09 (Myssy Clayson, detector-issues batch): a plain
+                # phone photo of a single-copy W-2 produces the same bimodal
+                # darkness signature from lighting/shadow/compression alone,
+                # with no overlay involved. EXIF camera metadata (set in
+                # analyze()) identifies this case.
+                suppress_darkness = legit_producer or self.redactions_detected or self._is_photographed_doc
                 suppression_reason = (
                     'a pre-printed IRS form overprinted with payroll data'
                     if legit_producer else
                     'heavy marker/ink redactions on the document'
+                    if self.redactions_detected else
+                    'normal lighting/shadow variance in a photographed document'
                 )
                 if text_std > 55:
                     if suppress_darkness:
@@ -4944,6 +4970,7 @@ RESPOND IN THIS JSON FORMAT:
         # Box numbering / structural (v2.3)
         box_check = ai_result.get('box_numbering_structure', {})
         if box_check.get('valid') is False:
+            is_photo = getattr(self, '_is_photographed_doc', False)
             for issue in box_check.get('issues', [])[:3]:
                 # 2026-09-02: on multi-copy ADP layouts, drop AI claims that
                 # "Box 12 has four rows without a/b/c/d suffixes" or "Box 13
@@ -4957,6 +4984,25 @@ RESPOND IN THIS JSON FORMAT:
                     continue
                 if is_multi_copy and self._looks_like_multi_copy_false_positive(issue, 'box_structure'):
                     self._note_multi_copy_suppression(issue, 'Invalid Box Numbering / Structure')
+                    continue
+                # 2026-11-09 (Myssy Clayson, detector-issues batch): the same
+                # misread (compact suffix letters / checkbox labels read as
+                # "missing") happens on a plain single-copy phone-photographed
+                # W-2, not just multi-copy ADP prints. Photo resolution and
+                # angle compress small suffix text the same way a shrunk
+                # multi-copy layout does. Downgrade to a low-weight info note
+                # instead of a critical flag so a reviewer still sees it, but
+                # it does not drive the risk score the way a real structural
+                # defect should.
+                if is_photo and self._looks_like_multi_copy_false_positive(issue, 'box_structure'):
+                    self._add_flag(
+                        'Box Structure Observation (Photographed Document)',
+                        f'{issue} This document was identified as a phone photo (camera EXIF present); '
+                        f'compact suffix letters and checkbox labels are commonly unreadable at photo '
+                        f'resolution/angle and this pattern alone is not treated as fabrication evidence.',
+                        'info',
+                        0,
+                    )
                     continue
                 self._add_flag(
                     'Invalid Box Numbering / Structure',
